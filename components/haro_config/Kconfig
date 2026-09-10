@@ -1,0 +1,26 @@
+menu "Haro Config"
+
+    config HARO_DEFAULT_SERVER_URL
+        string "Default Haro server WebSocket URL"
+        default "ws://192.168.1.100:8765"
+        help
+            Compile-time fallback server URL, used by
+            haro_config_get_server_url() only when NVS has no "server_url"
+            value yet (e.g. a factory-fresh device that has never had
+            haro_config_set_server_url() called on it -- nothing in the
+            current boot path calls it; see main.c and Task 3's
+            haro_config component).
+
+            Without this fallback, a factory-fresh device's NVS read
+            returns ESP_ERR_NVS_NOT_FOUND, which previously propagated to
+            an ESP_ERROR_CHECK() abort in app_main() -- a permanent
+            boot crash-loop, since CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT
+            reboots with no delay.
+
+            This is a stopgap, not a substitute for real provisioning:
+            override this value for your deployment before flashing
+            production devices, or write the real URL to NVS (e.g. via
+            esp_prov.py's custom-data mechanism, once a task wires that
+            up) as soon as the device is provisioned.
+
+endmenu
