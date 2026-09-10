@@ -1,5 +1,5 @@
 if(IDF_TARGET STREQUAL "linux")
-    set(main_reqs unity protocol)
+    set(main_reqs unity protocol orchestrator)
 else()
     set(main_reqs audio_pipeline wake_word)
 endif()
