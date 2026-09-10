@@ -422,6 +422,11 @@ esp_err_t face_display_init(void)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .dc_bit_offset = 6,
+        // Required by the newer i2c_master driver (i2c_master_bus_add_device
+        // rejects 0 as "invalid scl frequency") -- found on real hardware,
+        // not caught by any build since it's a runtime-only default-zero
+        // field, not a compile error. 400kHz is SSD1306's standard Fast Mode.
+        .scl_speed_hz = 400000,
     };
     err = esp_lcd_new_panel_io_i2c(bus, &io_config, &io_handle);
     if (err != ESP_OK) {
@@ -447,6 +452,12 @@ esp_err_t face_display_init(void)
 
 esp_err_t face_display_show(face_expression_t expression)
 {
+    // s_panel is NULL if face_display_init() was never called or never
+    // completed successfully (e.g. no physical display wired up) -- no-op
+    // rather than dereference a null panel handle through esp_lcd's vtable.
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
     face_display_render(expression, s_framebuffer);
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
 }
