@@ -12,8 +12,10 @@ cronica sull'alimentazione, un modulo OLED difettoso) si è deciso di
 affiancare — non sostituire — quel lavoro con un nuovo dispositivo basato
 su **Waveshare ESP32-S3-AUDIO-Board**, che integra in hardware quello che
 sul Pi era stato assemblato a mano su breadboard: codec audio (ES8311 +
-ES7210 + ampli MP1605GTF-Z), espansore GPIO (TCA9555), RTC, gestione
-batteria.
+ES7210 + ampli **NS4150B**), espansore GPIO (TCA9555), RTC, gestione
+batteria (il regolatore MP1605GTF-Z genera l'alimentazione ~3.3V della
+board — non è l'amplificatore audio, correzione rispetto a una prima
+lettura della scheda tecnica).
 
 Questo documento descrive il design del nuovo firmware. Il codice Python
 esistente in `haro/` **non viene toccato** e resta il riferimento
@@ -54,14 +56,21 @@ Haro/
   questo tipo di hardware) ha droppato IDF 5.x per lo stesso motivo —
   ESP-SR e i componenti codec più recenti assumono le API v6.x.
 - Target: `esp32s3`.
+- **ESP-SR: usare `espressif/esp-sr` versione `>=2.5.0`** (idealmente
+  l'ultima, `2.5.3` al momento di questa spec) — è la versione che ha
+  risolto un'incompatibilità nota tra Kconfig di ESP-SR e IDF v6.1. Il
+  demo ufficiale Waveshare per questa board fissa `^2.1.5` (una versione
+  precedente al fix, nel suo manifest), ma il vincolo caret (`^2.1.5`)
+  risolve comunque all'ultima `2.x` disponibile sul registro se non la si
+  fissa esplicitamente più stretta — non declassare a `2.1.5` esatto.
 
 ## Hardware target
 
 Waveshare ESP32-S3-AUDIO-Board:
 - ESP32-S3R8 (dual-core, 8MB PSRAM, 16MB flash)
-- Codec **ES8311** (playback) + **ES7210** (mic array, con cancellazione
-  eco) — bus I2C interno alla board, non condiviso con l'header esterno
-- Ampli di potenza **MP1605GTF-Z**
+- Codec **ES8311** (playback) + **ES7210** (mic array a 4 canali, con
+  cancellazione eco) + ampli **NS4150B** — bus I2C interno alla board,
+  non condiviso con l'header esterno
 - Espansore GPIO **TCA9555** (per pulsanti/LED onboard)
 - Header 18 pin: 11 GPIO liberi (GPIO3-11, GPIO19-20) + 3 EXIO (via
   TCA9555, I2C, più lenti) + alimentazione (5V, 3V3, GND)
@@ -69,18 +78,60 @@ Waveshare ESP32-S3-AUDIO-Board:
   collegato su 2 dei GPIO liberi dell'header come bus I2C dedicato (es.
   GPIO8=SDA, GPIO9=SCL), separato dal bus I2C interno della board
 
+**Pin mapping interno verificato** (dal firmware demo ufficiale
+Waveshare, `ESP32-S3-AUDIO-Board-Demo.zip` → `ESP-IDF/esp_sr_02/main/hardeware_driver/bsp_board.h`
+— non da fonti terze o dedotto dallo schema):
+
+| Segnale | GPIO |
+|---|---|
+| I2C SCL (controllo ES8311/ES7210/TCA9555) | GPIO10 |
+| I2C SDA | GPIO11 |
+| I2S MCLK | GPIO12 |
+| I2S BCLK | GPIO13 |
+| I2S WS/LRCK | GPIO14 |
+| I2S DIN (mic, ES7210→ESP32) | GPIO15 |
+| I2S DOUT (speaker, ESP32→ES8311) | GPIO16 |
+
+Stesso bus I2S condiviso (porta `I2S_NUM_1`) per capture e playback,
+stesso principio già validato sul Pi con l'overlay `haro-duplex`, qui
+però gestito nativamente da `esp_codec_dev` invece che da un device tree
+overlay scritto a mano.
+
 ## Componenti (mappatura su moduli nativi ESP-IDF/Espressif)
 
 | Component progetto | Componente nativo/ufficiale | Responsabilità nostra |
 |---|---|---|
-| `audio_pipeline` | `esp_codec_dev` (Espressif) | Configurazione specifica della board (I2C addr, pin I2S) |
-| `wake_word` | ESP-SR (AFE + WakeNet "Hi ESP" + VAD, pacchetto ufficiale Espressif) | Collegamento tra AFE e orchestrator (code FreeRTOS) |
+| `audio_pipeline` | `esp_codec_dev` (Espressif, `espressif/esp_codec_dev` sul registro) + `esp_io_expander_tca95xx_16bit` (Espressif, per il TCA9555) | Configurazione specifica della board (pin/indirizzi qui sopra), porting da `bsp_board.c` di Waveshare |
+| `wake_word` | ESP-SR (`espressif/esp-sr`, AFE + WakeNet "hiesp" + VAD) | Collegamento tra AFE e orchestrator (code FreeRTOS), adattato da `mic_speech.c` di Waveshare (senza la parte MultiNet/comandi vocali, non ci serve) |
 | `protocol` | cJSON (incluso in ESP-IDF) | Schema messaggi: `hello`, `end_of_speech`, `emotion`, `response_end`, `error` — identico a `haro/src/haro/protocol.py` |
 | `server_client` | `esp_websocket_client` (componente managed ufficiale) | Riconnessione con backoff esponenziale, stessa logica di `server_client.py` |
-| `face_display` | `espressif/ssd1306` (componente ufficiale dal registro) | Porting della logica di disegno "Cozmo-style" da `face_display.py` (occhi a pillola inclinabili, bocca ad arco con estremità arrotondate) |
-| `wifi_provisioning` | Wi-Fi Provisioning Manager (ufficiale ESP-IDF, SoftAP + web) | Configurazione (SSID hotspot, ecc.) |
+| `face_display` | `esp_lcd` + `esp_lcd_panel_ssd1306.h` (**core ESP-IDF**, non componente esterno — vedi nota sotto) | Porting della logica di disegno "Cozmo-style" da `face_display.py` (occhi a pillola inclinabili, bocca ad arco con estremità arrotondate), framebuffer composto a mano e passato a `esp_lcd_panel_draw_bitmap` |
+| `wifi_provisioning` | `network_provisioning` (componente managed ufficiale, **non** `wifi_provisioning` — rinominato in ESP-IDF v6.x, vedi nota sotto) | Configurazione (SSID hotspot, ecc.) |
 | `config` | NVS (storage nativo ESP-IDF) | Schema chiavi (`server_url`, ecc.), sostituisce il file `config.json` del Pi |
 | `orchestrator` | — (logica di business specifica di Haro) | Intera macchina a stati, porting diretto di `orchestrator.py` |
+
+**Nota sul display** — il componente `espressif/ssd1306` del registro
+(quello inizialmente previsto) è **deprecato** ("please use updated
+SSD1306 driver from ESP-IDF"). Il sostituto è integrato nel core ESP-IDF
+sotto l'astrazione `esp_lcd` (`esp_lcd_new_panel_ssd1306()`), da
+aggiungere solo con un `#include`, senza dipendenza nel registro.
+`esp_lcd` è un layer di trasporto (spinge un framebuffer, non ha
+primitive di disegno) — la logica di rettangoli arrotondati/archi resta
+comunque nostra, come previsto, cambia solo la funzione di push finale.
+
+**Nota sul WiFi provisioning** — `wifi_provisioning` è stato rimosso dal
+core ESP-IDF in v6.x, sostituito dal componente managed
+`network_provisioning` (stessa funzione, prefisso API `network_prov_*`
+invece di `wifi_prov_*`). **Punto aperto, non risolto dalla sola
+documentazione**: non è confermato se lo schema SoftAP di
+`network_provisioning` serva di suo una pagina web compilabile da
+browser (come il captive portal custom del Pi oggi) o si aspetti il
+protocollo protocomm/protobuf parlato dall'app companion Espressif o dal
+tool `esp_prov.py`. Va verificato leggendo il sorgente dello schema
+SoftAP prima di implementare quel task — se non offre una pagina HTML
+pronta, serve decidere se accettare il flusso "app companion" (cambio di
+UX reale rispetto a oggi) o costruire una pagina custom sopra gli
+endpoint HTTP nativi.
 
 Riferimento architetturale (non di protocollo): il progetto open-source
 **Xiaozhi** (`78/xiaozhi-esp32`, con build mantenuta da Waveshare per
@@ -133,8 +184,9 @@ THINKING --(end_of_speech inviato)--> attesa eventi server
 Porting 1:1 della logica di `face_display.py` (rettangoli arrotondati
 inclinabili per gli occhi, archi con estremità arrotondate per la bocca,
 le 9 espressioni già definite: IDLE, LISTENING, THINKING,
-SPEAKING_HAPPY/SAD/CONFUSED/NEUTRAL, ERROR, SETUP) usando le primitive di
-disegno del componente `espressif/ssd1306` invece di PIL. Stesso
+SPEAKING_HAPPY/SAD/CONFUSED/NEUTRAL, ERROR, SETUP), componendo un
+framebuffer 1-bit a mano (stesso ruolo che aveva PIL) e passandolo a
+`esp_lcd_panel_draw_bitmap` (vedi nota su `esp_lcd` sopra). Stesso
 linguaggio visivo validato sul Pi, incluso il fix già fatto lì
 (radius-clamping) — non lo si riscopre da zero.
 
