@@ -103,7 +103,7 @@ overlay scritto a mano.
 |---|---|---|
 | `audio_pipeline` | `esp_codec_dev` (Espressif, `espressif/esp_codec_dev` sul registro) + `esp_io_expander_tca95xx_16bit` (Espressif, per il TCA9555) | Configurazione specifica della board (pin/indirizzi qui sopra), porting da `bsp_board.c` di Waveshare |
 | `wake_word` | ESP-SR (`espressif/esp-sr`, AFE + WakeNet "hiesp" + VAD) | Collegamento tra AFE e orchestrator (code FreeRTOS), adattato da `mic_speech.c` di Waveshare (senza la parte MultiNet/comandi vocali, non ci serve) |
-| `protocol` | cJSON (incluso in ESP-IDF) | Schema messaggi: `hello`, `end_of_speech`, `emotion`, `response_end`, `error` — identico a `haro/src/haro/protocol.py` |
+| `protocol` | cJSON via il componente registry **`espressif/cjson`** (in ESP-IDF v6.1 non è più un componente builtin chiamato `json` — verificato durante l'implementazione: rimosso dal core, esternalizzato al registro, come già successo a `wifi_provisioning`→`network_provisioning`) | Schema messaggi: `hello`, `end_of_speech`, `emotion`, `response_end`, `error` — identico a `haro/src/haro/protocol.py` |
 | `server_client` | `esp_websocket_client` (componente managed ufficiale) | Riconnessione con backoff esponenziale, stessa logica di `server_client.py` |
 | `face_display` | `esp_lcd` + `esp_lcd_panel_ssd1306.h` (**core ESP-IDF**, non componente esterno — vedi nota sotto) | Porting della logica di disegno "Cozmo-style" da `face_display.py` (occhi a pillola inclinabili, bocca ad arco con estremità arrotondate), framebuffer composto a mano e passato a `esp_lcd_panel_draw_bitmap` |
 | `wifi_provisioning` | `network_provisioning` (componente managed ufficiale, **non** `wifi_provisioning` — rinominato in ESP-IDF v6.x, vedi nota sotto) | Configurazione (SSID hotspot, ecc.) |
