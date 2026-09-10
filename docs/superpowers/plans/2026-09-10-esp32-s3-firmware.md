@@ -79,19 +79,20 @@ Each component owns one Python module's responsibility (see the spec's mapping t
 ### Task 1: Project scaffolding + Linux host test harness
 
 **Files:**
-- Create: `esp32-firmware/CMakeLists.txt`
-- Create: `esp32-firmware/main/CMakeLists.txt`
-- Create: `esp32-firmware/main/main.c`
-- Create: `esp32-firmware/sdkconfig.defaults`
-- Create: `esp32-firmware/.gitignore`
+- Create: `CMakeLists.txt`
+- Create: `main/CMakeLists.txt`
+- Create: `main/main.c`
+- Create: `sdkconfig.defaults`
+- Create: `.gitignore`
 
 **Interfaces:**
 - Produces: a buildable, flashable "hello world" ESP-IDF v6.1 project for `esp32s3`, and a working `idf.py --preview set-target linux` host-test flow that later tasks' `test/` directories plug into.
 
 - [ ] **Step 1: Create the project**
 
+Run from the repo root (the worktree root — this project's `CMakeLists.txt` belongs directly there, not in a nested subdirectory of any name):
+
 ```bash
-cd /Users/leonardo/Progetti/Haro/esp32-firmware
 idf.py create-project --path . haro_firmware
 ```
 
@@ -188,37 +189,27 @@ This mirrors `haro/src/haro/protocol.py` exactly: `encode_hello`, `encode_end_of
 
 - [ ] **Step 1: Create the test-only component structure**
 
-`components/protocol/CMakeLists.txt`:
-```cmake
-idf_component_register(
-    SRCS "protocol.c"
-    INCLUDE_DIRS "include"
-    REQUIRES json
-)
-
-if(CONFIG_IDF_TARGET_LINUX)
-    idf_component_register(
-        SRC_DIRS "." "test"
-        INCLUDE_DIRS "include"
-        REQUIRES json unity
-    )
-endif()
+cJSON is not a builtin ESP-IDF component in v6.1 — it's the managed registry package `espressif/cjson` (resolved component name `cjson`). Create `components/protocol/idf_component.yml`:
+```yaml
+dependencies:
+  espressif/cjson: "^1.7.19"
 ```
 
-Note: `idf_component_register` can only be called once per component — replace the two-call sketch above with a single conditional `SRC_DIRS`/`REQUIRES` selection:
+`components/protocol/CMakeLists.txt` — use the plain CMake `IDF_TARGET` variable, not the Kconfig-derived `CONFIG_IDF_TARGET_LINUX`: component-level `REQUIRES`/`SRCS` selection is evaluated during CMake's early component-requirements-expansion pass, before Kconfig has been processed, so `CONFIG_*` variables are not reliably set yet at that point (confirmed empirically — using the Kconfig variable here silently resolves both branches wrong, with no error, dropping `unity`/the test sources from the component's actual requirements even though the overall target is correctly linux). `IDF_TARGET` is a plain CMake variable set early via `-DIDF_TARGET=...` and is reliable in this position (it's the same variable the root `CMakeLists.txt` in Task 1 checks). This component also needs `WHOLE_ARCHIVE` — without it, the test object file's self-registering `TEST_CASE`s get dropped by the linker's dead-code elimination since nothing in the reachable call graph from `app_main` references them directly:
 ```cmake
-if(CONFIG_IDF_TARGET_LINUX)
+if(IDF_TARGET STREQUAL "linux")
     set(srcs "protocol.c" "test/test_protocol.c")
-    set(reqs json unity)
+    set(reqs cjson unity)
 else()
     set(srcs "protocol.c")
-    set(reqs json)
+    set(reqs cjson)
 endif()
 
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "include"
     REQUIRES ${reqs}
+    WHOLE_ARCHIVE
 )
 ```
 
@@ -329,13 +320,54 @@ TEST_CASE("parse_server_message rejects an unknown type", "[protocol]")
 
 - [ ] **Step 4: Create a minimal Linux-target test app that pulls this component in**
 
-`main/CMakeLists.txt` needs `set(COMPONENTS main protocol)` guarded for the linux target per the host-testing docs (see Task 1's research: a Linux-target app must list `COMPONENTS` explicitly to skip auto-including every IDF component). Add near the top of the root `CMakeLists.txt`:
+`main/CMakeLists.txt` needs `set(COMPONENTS main protocol)` guarded for the linux target per the host-testing docs (see Task 1's research: a Linux-target app must list `COMPONENTS` explicitly to skip auto-including every IDF component). Add near the top of the root `CMakeLists.txt`, placed BEFORE `include($ENV{IDF_PATH}/tools/cmake/project.cmake)`:
 
 ```cmake
 if(IDF_TARGET STREQUAL "linux")
     set(COMPONENTS main protocol)
 endif()
-```//placed BEFORE `include($ENV{IDF_PATH}/tools/cmake/project.cmake)`
+```
+
+There is no automatic mechanism that runs `TEST_CASE`s just because `unity` is linked in — `main/main.c`'s `app_main()` must call the Unity runner itself, and only for the linux target (the real esp32s3 firmware must not link Unity or run tests). Update `main/main.c` and `main/CMakeLists.txt`:
+
+`main/main.c`:
+```c
+#include "esp_log.h"
+
+#if CONFIG_IDF_TARGET_LINUX
+#include "unity.h"
+
+void app_main(void)
+{
+    UNITY_BEGIN();
+    unity_run_all_tests();
+    UNITY_END();
+}
+#else
+static const char *TAG = "haro";
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Haro firmware starting");
+}
+#endif
+```
+(the `#if CONFIG_IDF_TARGET_LINUX` here is a C preprocessor check against `sdkconfig.h`, evaluated at actual compile time after Kconfig is fully resolved — unlike the CMake-level `CONFIG_IDF_TARGET_LINUX` pitfall above, this one is fine and is ESP-IDF's normal way to guard target-specific C code.)
+
+`main/CMakeLists.txt`:
+```cmake
+if(IDF_TARGET STREQUAL "linux")
+    set(main_reqs unity protocol)
+else()
+    set(main_reqs "")
+endif()
+
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    REQUIRES ${main_reqs}
+)
+```
 
 - [ ] **Step 5: Run the tests and confirm they fail to build (protocol.c doesn't exist yet)**
 
@@ -1077,7 +1109,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
     }
     case WEBSOCKET_EVENT_DISCONNECTED: {
-        server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_DISCONNECTED };
+        orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_DISCONNECTED };
         xQueueSend(s_event_queue, &evt, 0);
         break;
     }
@@ -1164,10 +1196,23 @@ git commit -m "feat: add server_client component (esp_websocket_client + protoco
 - Create: `components/orchestrator/test/test_orchestrator.c`
 
 **Interfaces:**
-- Consumes: `protocol.h` (Task 2) for `protocol_event_t`.
+- Consumes: `protocol.h` (Task 2) for `protocol_event_t` only — **not** `server_client.h`. `orchestrator` must stay hardware/network-free to build on the Linux host target; `server_client` (Task 6) requires `esp_websocket_client`, a networking component not confirmed to build under `idf.py --preview set-target linux`. `orchestrator.h` instead defines its own local mirror type with the same four fields as Task 6's `server_client_event_t`, and `main.c` (Task 10) translates between the two at the call site.
 - Produces (used by `main.c` in Task 10):
   ```c
   typedef enum { HARO_STATE_IDLE, HARO_STATE_LISTENING, HARO_STATE_THINKING, HARO_STATE_SPEAKING } haro_state_t;
+
+  typedef enum {
+      ORCHESTRATOR_SERVER_EVENT_PROTOCOL,
+      ORCHESTRATOR_SERVER_EVENT_AUDIO,
+      ORCHESTRATOR_SERVER_EVENT_DISCONNECTED,
+  } orchestrator_server_event_type_t;
+
+  typedef struct {
+      orchestrator_server_event_type_t type;
+      protocol_event_t protocol_event;
+      const uint8_t *audio_data;
+      size_t audio_len;
+  } orchestrator_server_event_t;  // mirrors server_client_event_t (Task 6) field-for-field; main.c translates
 
   typedef struct {
       esp_err_t (*send_audio_frame)(void *ctx, const uint8_t *data, size_t len);
@@ -1196,33 +1241,34 @@ git commit -m "feat: add server_client component (esp_websocket_client + protoco
   haro_state_t orchestrator_get_state(void);
   void orchestrator_on_wake_word(void);
   void orchestrator_on_audio_frame(const uint8_t *frame, size_t len, bool is_end_of_speech);
-  void orchestrator_on_server_event(server_client_event_t event); // Task 6's type
+  void orchestrator_on_server_event(orchestrator_server_event_t event);
   ```
 
 This is a direct, faithful port of `orchestrator.py`'s state machine (`IDLE → LISTENING → THINKING → SPEAKING`, same triggers, same error/reconnect handling), dependency-injected the same way the Python version takes `Protocol`-typed fakes in `tests/test_orchestrator.py` — here via `orchestrator_ops_t`'s function pointers instead of duck typing.
 
 - [ ] **Step 1: Set up the Linux-target test component (same pattern as Task 2)**
 
-`components/orchestrator/CMakeLists.txt`:
+`components/orchestrator/CMakeLists.txt` — use `IDF_TARGET STREQUAL "linux"`, not `CONFIG_IDF_TARGET_LINUX` (see Task 2 Step 1's note: the Kconfig-derived variable is not reliably set yet when component `REQUIRES`/`SRCS` are evaluated). `REQUIRES` is `protocol` only — not `server_client`, per the interface note above. Needs `WHOLE_ARCHIVE` for the same reason as `protocol`'s test file (linker dead-code elimination would otherwise drop the self-registering `TEST_CASE`s):
 ```cmake
-if(CONFIG_IDF_TARGET_LINUX)
+if(IDF_TARGET STREQUAL "linux")
     set(srcs "orchestrator.c" "test/test_orchestrator.c")
-    set(reqs unity protocol server_client)
+    set(reqs unity protocol)
 else()
     set(srcs "orchestrator.c")
-    set(reqs protocol server_client)
+    set(reqs protocol)
 endif()
 
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "include"
     REQUIRES ${reqs}
+    WHOLE_ARCHIVE
 )
 ```
 
 Add `orchestrator` to the linux-target `COMPONENTS` list in the root `CMakeLists.txt` alongside `protocol` (from Task 2 Step 4).
 
-- [ ] **Step 2: Write the header** (as specified in Interfaces above — create `components/orchestrator/include/orchestrator.h` verbatim from that block, plus `#include "server_client.h"` for `server_client_event_t`)
+- [ ] **Step 2: Write the header** (as specified in Interfaces above — create `components/orchestrator/include/orchestrator.h` verbatim from that block; it defines `orchestrator_server_event_t` locally, no `#include "server_client.h"`)
 
 - [ ] **Step 3: Write the failing tests, porting the key cases from `haro/tests/test_orchestrator.py`**
 
@@ -1322,7 +1368,7 @@ TEST_CASE("an emotion event moves THINKING to SPEAKING and shows the matching fa
     uint8_t frame[] = { 1 };
     orchestrator_on_audio_frame(frame, sizeof(frame), true);
 
-    server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_PROTOCOL };
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
     evt.protocol_event.type = PROTOCOL_EVENT_EMOTION;
     strcpy(evt.protocol_event.value, "happy");
     orchestrator_on_server_event(evt);
@@ -1337,7 +1383,7 @@ TEST_CASE("an audio event while SPEAKING plays the chunk", "[orchestrator]")
     uint8_t frame[] = { 1 };
     orchestrator_on_audio_frame(frame, sizeof(frame), true);
 
-    server_client_event_t audio_evt = { .type = SERVER_CLIENT_EVENT_AUDIO };
+    orchestrator_server_event_t audio_evt = { .type = ORCHESTRATOR_SERVER_EVENT_AUDIO };
     uint8_t chunk[] = { 9, 9, 9 };
     audio_evt.audio_data = chunk;
     audio_evt.audio_len = sizeof(chunk);
@@ -1353,7 +1399,7 @@ TEST_CASE("response_end returns to IDLE", "[orchestrator]")
     uint8_t frame[] = { 1 };
     orchestrator_on_audio_frame(frame, sizeof(frame), true);
 
-    server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_PROTOCOL };
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
     evt.protocol_event.type = PROTOCOL_EVENT_RESPONSE_END;
     orchestrator_on_server_event(evt);
 
@@ -1364,7 +1410,7 @@ TEST_CASE("a disconnect event returns to IDLE", "[orchestrator]")
 {
     orchestrator_init(make_fake_ops());
     orchestrator_on_wake_word();
-    server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_DISCONNECTED };
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_DISCONNECTED };
     orchestrator_on_server_event(evt);
     TEST_ASSERT_EQUAL(HARO_STATE_IDLE, orchestrator_get_state());
 }
@@ -1439,14 +1485,14 @@ static void return_to_idle(void)
     s_ops.face.show(s_ops.face.ctx, EXPR_IDLE);
 }
 
-void orchestrator_on_server_event(server_client_event_t event)
+void orchestrator_on_server_event(orchestrator_server_event_t event)
 {
     if (s_state != HARO_STATE_THINKING && s_state != HARO_STATE_SPEAKING) {
-        if (event.type != SERVER_CLIENT_EVENT_DISCONNECTED) return;
+        if (event.type != ORCHESTRATOR_SERVER_EVENT_DISCONNECTED) return;
     }
 
     switch (event.type) {
-    case SERVER_CLIENT_EVENT_PROTOCOL:
+    case ORCHESTRATOR_SERVER_EVENT_PROTOCOL:
         if (event.protocol_event.type == PROTOCOL_EVENT_EMOTION) {
             s_state = HARO_STATE_SPEAKING;
             s_ops.face.show(s_ops.face.ctx, expression_for_emotion(event.protocol_event.value));
@@ -1457,11 +1503,11 @@ void orchestrator_on_server_event(server_client_event_t event)
             return_to_idle();
         }
         break;
-    case SERVER_CLIENT_EVENT_AUDIO:
+    case ORCHESTRATOR_SERVER_EVENT_AUDIO:
         s_state = HARO_STATE_SPEAKING;
         s_ops.audio_out.play_chunk(s_ops.audio_out.ctx, event.audio_data, event.audio_len);
         break;
-    case SERVER_CLIENT_EVENT_DISCONNECTED:
+    case ORCHESTRATOR_SERVER_EVENT_DISCONNECTED:
         s_ops.face.show(s_ops.face.ctx, EXPR_ERROR);
         return_to_idle();
         break;
@@ -1768,6 +1814,22 @@ static void face_show(void *ctx, int expression)
     face_display_show((face_expression_t)expression);
 }
 
+// orchestrator is deliberately decoupled from server_client (Task 7's
+// ruling: keeps it buildable on the Linux host target without pulling in
+// esp_websocket_client) — translate at this one call site.
+static orchestrator_server_event_t to_orchestrator_event(const server_client_event_t *src)
+{
+    orchestrator_server_event_t dst = { .protocol_event = src->protocol_event };
+    switch (src->type) {
+    case SERVER_CLIENT_EVENT_PROTOCOL:     dst.type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL; break;
+    case SERVER_CLIENT_EVENT_AUDIO:        dst.type = ORCHESTRATOR_SERVER_EVENT_AUDIO; break;
+    case SERVER_CLIENT_EVENT_DISCONNECTED: dst.type = ORCHESTRATOR_SERVER_EVENT_DISCONNECTED; break;
+    }
+    dst.audio_data = src->audio_data;
+    dst.audio_len = src->audio_len;
+    return dst;
+}
+
 static void orchestrator_task(void *arg)
 {
     while (true) {
@@ -1778,7 +1840,7 @@ static void orchestrator_task(void *arg)
 
         server_client_event_t server_evt;
         if (xQueueReceive(s_server_queue, &server_evt, pdMS_TO_TICKS(20)) == pdTRUE) {
-            orchestrator_on_server_event(server_evt);
+            orchestrator_on_server_event(to_orchestrator_event(&server_evt));
             if (server_evt.type == SERVER_CLIENT_EVENT_AUDIO) {
                 free(server_evt.audio_data);
             }
