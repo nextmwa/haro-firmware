@@ -30,3 +30,16 @@ CONFIG_SR_WN_WN9_HIESP=y
 # string (matching the Pi's hotspot_password model) rather than SRP6a's
 # per-device salt/verifier provisioning story.
 CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
+
+# PSRAM was never enabled anywhere in this project despite this board's
+# ESP32-S3R8 module having 8MB of Octal PSRAM in-package (see design spec) --
+# a gap no task/review caught, since it's a chip/board-level setting that
+# only breaks at runtime under memory pressure, not at compile time. Found
+# on real hardware: wake_word_start() crashes (EXCCAUSE StoreProhibited)
+# inside ESP-SR's AFE init, which does a heap_caps_malloc(..., MALLOC_CAP_SPIRAM)
+# for its internal buffers (components/wake_word/wake_word.c already assumed
+# PSRAM was available) -- without CONFIG_SPIRAM, that allocation has nowhere
+# to come from and the library dereferences the resulting NULL.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
