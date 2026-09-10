@@ -1,5 +1,16 @@
 dependencies:
-  espressif/esp_codec_dev: ">=1.5.1"
+  # espressif/esp_codec_dev's own CMakeLists.txt unconditionally REQUIRES
+  # esp_hal_ana_conv, which self-excludes on the linux target (its
+  # CMakeLists.txt does `if(target STREQUAL "linux") return()` before ever
+  # calling idf_component_register) -- so on linux it's simply never
+  # registered, and esp_codec_dev's unconditional REQUIRES on it fails
+  # dependency resolution before set(COMPONENTS ...) even gets a chance to
+  # exclude audio_pipeline (which is the only consumer) from the linux
+  # build. Gate it the same way as esp-sr below.
+  espressif/esp_codec_dev:
+    version: ">=1.5.1"
+    rules:
+      - if: "target != linux"
   # esp-sr's own manifest depends on espressif/esp-dl >=3.3.10, which has no
   # version supporting the "linux" preview target (idf.py --preview
   # set-target linux, used by Task 1's host-test flow / protocol's test/
