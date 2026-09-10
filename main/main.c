@@ -181,7 +181,16 @@ void app_main(void)
     ESP_ERROR_CHECK(haro_config_init());
     ESP_ERROR_CHECK(wifi_provisioning_ensure_connected());
     ESP_ERROR_CHECK(audio_pipeline_init());
-    ESP_ERROR_CHECK(face_display_init());
+
+    // TEMPORARY, for hardware bring-up: no physical SSD1306 is wired up
+    // yet, and face_display_init()'s I2C init sequence hangs the whole
+    // main_task (task watchdog fires) when nothing acks on the bus --
+    // esp_lcd's I2C transactions block with no timeout on a dead bus, so
+    // the "non-fatal ESP_ERROR_CHECK" wrapper never even gets a return
+    // value to check. Skipping the call entirely until either the display
+    // is wired up or this component gets real hardware-absent handling
+    // (a bus probe / transaction timeout) -- see TODO in face_display.c.
+    ESP_LOGW(TAG, "face_display_init() skipped for bring-up -- no display wired up yet");
 
     char server_url[128];
     ESP_ERROR_CHECK(haro_config_get_server_url(server_url, sizeof(server_url)));
