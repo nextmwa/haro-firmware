@@ -29,6 +29,7 @@ void app_main(void)
 static const char *TAG = "haro";
 static QueueHandle_t s_wake_queue;
 static QueueHandle_t s_server_queue;
+static QueueHandle_t s_audio_frame_queue;
 
 // Mirrors the Python orchestrator's "a send failure during LISTENING
 // triggers a reconnect" behavior (flagged in Task 7's review): on a failed
@@ -51,7 +52,9 @@ static QueueHandle_t s_server_queue;
 static void enqueue_synthetic_disconnect(void)
 {
     server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_DISCONNECTED };
-    xQueueSend(s_server_queue, &evt, 0);
+    if (xQueueSend(s_server_queue, &evt, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "server_queue full, dropped synthetic DISCONNECTED event");
+    }
 }
 
 static esp_err_t server_send_audio_frame(void *ctx, const uint8_t *data, size_t len)
@@ -116,12 +119,12 @@ static void orchestrator_task(void *arg)
 {
     // Set when wake_word posts WAKE_WORD_SPEECH_END (see wake_word.c's
     // detect_task), consumed and cleared the next time an audio frame is
-    // forwarded to orchestrator_on_audio_frame() below. wake_word and this
-    // task read the mic stream independently in real time, so exact
-    // same-chunk alignment between "AFE observed silence" and "the next
-    // frame this task reads" isn't guaranteed, but both track the live
-    // stream, so the flag reflects "speech just ended" within roughly one
-    // frame's latency either way.
+    // forwarded to orchestrator_on_audio_frame() below. wake_word's
+    // detect_task and feed_task track the live mic stream independently in
+    // real time, so exact same-chunk alignment between "AFE observed
+    // silence" and "the next frame drained from s_audio_frame_queue" isn't
+    // guaranteed, but both track the live stream, so the flag reflects
+    // "speech just ended" within roughly one frame's latency either way.
     bool pending_speech_end = false;
 
     while (true) {
@@ -135,6 +138,17 @@ static void orchestrator_task(void *arg)
             }
         }
 
+        // wake_word.c's feed_task is the sole caller of audio_pipeline_read()
+        // in the whole component graph (see wake_word.c file header comment
+        // item 6 -- i2s_channel_read() is single-consumer; two independent
+        // readers would silently split the one physical mic stream instead
+        // of each seeing the complete thing). Arm/disarm its forwarding of
+        // raw frames onto s_audio_frame_queue to match whether we currently
+        // want to forward mic audio to the server, rather than reading the
+        // mic here ourselves.
+        bool listening = (orchestrator_get_state() == HARO_STATE_LISTENING);
+        wake_word_set_audio_forwarding(listening);
+
         server_client_event_t server_evt;
         if (xQueueReceive(s_server_queue, &server_evt, pdMS_TO_TICKS(20)) == pdTRUE) {
             orchestrator_on_server_event(to_orchestrator_event(&server_evt));
@@ -143,14 +157,21 @@ static void orchestrator_task(void *arg)
             }
         }
 
-        if (orchestrator_get_state() == HARO_STATE_LISTENING) {
-            uint8_t frame[512];
-            size_t bytes_read;
-            if (audio_pipeline_read(frame, sizeof(frame), &bytes_read) == ESP_OK) {
+        // Drain every frame currently queued. Frames that arrived while we
+        // were still listening but that we're processing after state has
+        // since moved on (e.g. speech-end just flipped us to THINKING) are
+        // freed without forwarding -- `listening` above was sampled once at
+        // the top of this iteration and applies to the whole drain, so a
+        // frame queued moments before forwarding was disarmed is discarded
+        // here rather than sent late.
+        wake_word_audio_frame_t frame;
+        while (xQueueReceive(s_audio_frame_queue, &frame, 0) == pdTRUE) {
+            if (listening) {
                 bool is_end_of_speech = pending_speech_end;
                 pending_speech_end = false;
-                orchestrator_on_audio_frame(frame, bytes_read, is_end_of_speech);
+                orchestrator_on_audio_frame(frame.data, frame.len, is_end_of_speech);
             }
+            free(frame.data);
         }
     }
 }
@@ -167,10 +188,15 @@ void app_main(void)
 
     s_wake_queue = xQueueCreate(4, sizeof(wake_word_event_type_t));
     s_server_queue = xQueueCreate(8, sizeof(server_client_event_t));
+    // Depth 8: at low-cost AFE mode the feed chunk period is roughly
+    // 16-32ms, and orchestrator_task's own poll cadence is bounded by the
+    // 20ms server_queue timeout below -- 8 frames gives a few iterations'
+    // worth of slack before a frame would be dropped as "queue full".
+    s_audio_frame_queue = xQueueCreate(8, sizeof(wake_word_audio_frame_t));
 
     ESP_ERROR_CHECK(server_client_init(server_url, s_server_queue));
     ESP_ERROR_CHECK(server_client_send_hello("haro-session"));
-    ESP_ERROR_CHECK(wake_word_start(s_wake_queue));
+    ESP_ERROR_CHECK(wake_word_start(s_wake_queue, s_audio_frame_queue));
 
     orchestrator_ops_t ops = {
         .server = { .send_audio_frame = server_send_audio_frame, .send_end_of_speech = server_send_end_of_speech },

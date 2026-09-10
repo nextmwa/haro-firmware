@@ -61,6 +61,24 @@
 //     (vad_state already VAD_SILENCE right at detection, e.g. between the
 //     spoken wake phrase and the user's actual question) doesn't immediately
 //     end listening before any question audio arrives.
+//
+//  6. (Task 10 review fix) Single-reader invariant: `i2s_channel_read()`
+//     (which `audio_pipeline_read()` wraps, via esp_codec_dev) is a single-
+//     consumer, semaphore-serialized read over one DMA ring buffer -- it
+//     does not fan out to multiple readers. Task 10's first pass had BOTH
+//     feed_task() below and a second task in main.c independently calling
+//     audio_pipeline_read() during HARO_STATE_LISTENING, which silently
+//     *split* the one physical mic stream between the two callers (each got
+//     a fraction, with gaps) instead of each seeing the complete stream --
+//     corrupting both AFE's feed (and therefore the vad_state/
+//     WAKE_WORD_SPEECH_END signal from item 5) and the raw audio actually
+//     forwarded to the server. Fixed by making feed_task() the ONLY caller
+//     of audio_pipeline_read() in the whole component graph: it now also
+//     hands a copy of each raw frame it reads to `audio_frame_queue`
+//     (wake_word_start's new second argument) whenever forwarding is armed
+//     via wake_word_set_audio_forwarding(), so main.c's
+//     server-audio-forwarding path gets the same complete, gap-free stream
+//     AFE does, without a second reader.
 #include "wake_word.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
@@ -70,16 +88,32 @@
 #include "esp_heap_caps.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 static const char *TAG = "wake_word";
 
 static const esp_afe_sr_iface_t *s_afe_handle;
 static QueueHandle_t s_event_queue;
+// May be NULL (caller doesn't want raw audio). See file header comment
+// item 6 and wake_word.h's wake_word_audio_frame_t.
+static QueueHandle_t s_audio_frame_queue;
+// Written only from wake_word_set_audio_forwarding() (any task), read only
+// from feed_task(). A plain bool is sufficient here: ESP32-S3 word-aligned
+// reads/writes are atomic in practice, there's exactly one writer, and the
+// consequence of a torn read is at worst one stale/skipped frame decision,
+// not a corrupted stream -- `volatile` is enough to stop the compiler from
+// caching feed_task()'s read of it across loop iterations.
+static volatile bool s_audio_forwarding_enabled;
 // Kept alive for the lifetime of the AFE instance: wakenet_model_name (and
 // the model coefficient data AFE reads at runtime) point into memory owned
 // by this list, which esp_srmodel_init() may mmap directly from the "model"
 // partition rather than copy.
 static srmodel_list_t *s_models;
+
+void wake_word_set_audio_forwarding(bool enable)
+{
+    s_audio_forwarding_enabled = enable;
+}
 
 static void feed_task(void *arg)
 {
@@ -87,11 +121,13 @@ static void feed_task(void *arg)
     int chunk_size = s_afe_handle->get_feed_chunksize(afe_data);   // samples per channel
     int channels = s_afe_handle->get_feed_channel_num(afe_data);   // total feed channels ("MM" -> 2)
     size_t frame_samples = (size_t)chunk_size * (size_t)channels;
+    size_t raw_bytes = frame_samples * sizeof(int32_t);
 
     // audio_pipeline's native format is 32-bit/sample (see file header
     // comment #3); AFE's feed() requires 16-bit/sample. Two buffers: one for
-    // the raw read, one truncated for AFE.
-    int32_t *raw = heap_caps_malloc(frame_samples * sizeof(int32_t), MALLOC_CAP_SPIRAM);
+    // the raw read, one truncated for AFE. `raw` is also the source data
+    // copied out to audio_frame_queue when forwarding is armed (item 6).
+    int32_t *raw = heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
     int16_t *pcm16 = heap_caps_malloc(frame_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (raw == NULL || pcm16 == NULL) {
         ESP_LOGE(TAG, "feed_task: buffer allocation failed");
@@ -101,11 +137,26 @@ static void feed_task(void *arg)
 
     while (true) {
         size_t bytes_read = 0;
-        esp_err_t err = audio_pipeline_read(raw, frame_samples * sizeof(int32_t), &bytes_read);
-        if (err != ESP_OK || bytes_read != frame_samples * sizeof(int32_t)) {
+        esp_err_t err = audio_pipeline_read(raw, raw_bytes, &bytes_read);
+        if (err != ESP_OK || bytes_read != raw_bytes) {
             ESP_LOGW(TAG, "feed_task: short/failed read (%s, %u bytes)", esp_err_to_name(err), (unsigned)bytes_read);
             continue;
         }
+
+        if (s_audio_frame_queue != NULL && s_audio_forwarding_enabled) {
+            uint8_t *copy = heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
+            if (copy == NULL) {
+                ESP_LOGW(TAG, "feed_task: audio frame forward alloc failed, dropping frame");
+            } else {
+                memcpy(copy, raw, raw_bytes);
+                wake_word_audio_frame_t frame = { .data = copy, .len = raw_bytes };
+                if (xQueueSend(s_audio_frame_queue, &frame, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "feed_task: audio_frame_queue full, dropping frame");
+                    heap_caps_free(copy);
+                }
+            }
+        }
+
         for (size_t i = 0; i < frame_samples; i++) {
             pcm16[i] = (int16_t)(raw[i] >> 16);
         }
@@ -133,7 +184,9 @@ static void detect_task(void *arg)
         if (res->wakeup_state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "wake word detected (word index %d)", res->wake_word_index);
             wake_word_event_type_t evt = WAKE_WORD_DETECTED;
-            xQueueSend(s_event_queue, &evt, 0);
+            if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "event_queue full, dropped WAKE_WORD_DETECTED");
+            }
             awaiting_speech_end = true;
             seen_speech = false;
         }
@@ -144,7 +197,9 @@ static void detect_task(void *arg)
             } else if (res->vad_state == VAD_SILENCE && seen_speech) {
                 ESP_LOGI(TAG, "speech end detected");
                 wake_word_event_type_t evt = WAKE_WORD_SPEECH_END;
-                xQueueSend(s_event_queue, &evt, 0);
+                if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "event_queue full, dropped WAKE_WORD_SPEECH_END");
+                }
                 awaiting_speech_end = false;
                 seen_speech = false;
             }
@@ -152,12 +207,13 @@ static void detect_task(void *arg)
     }
 }
 
-esp_err_t wake_word_start(QueueHandle_t event_queue)
+esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_queue)
 {
     if (event_queue == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     s_event_queue = event_queue;
+    s_audio_frame_queue = audio_frame_queue;  // may be NULL; see file header comment item 6
 
     s_models = esp_srmodel_init("model");
     if (s_models == NULL) {

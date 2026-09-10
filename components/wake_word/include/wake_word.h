@@ -2,6 +2,9 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,11 +25,42 @@ typedef enum {
     WAKE_WORD_SPEECH_END,
 } wake_word_event_type_t;
 
+// One raw mic frame, as read by wake_word's feed_task -- the SAME bytes fed
+// to AFE (pre-truncation, i.e. still audio_pipeline's native 32-bit/sample
+// format; see wake_word.c file header comment item 3), handed off to
+// whoever wants a copy of the live mic stream without calling
+// audio_pipeline_read() themselves.
+//
+// `data` is heap-allocated (heap_caps_malloc, MALLOC_CAP_SPIRAM); the
+// receiver takes ownership and must free() it after use.
+typedef struct {
+    uint8_t *data;
+    size_t len;
+} wake_word_audio_frame_t;
+
 // Starts the AFE feed+detect tasks. `event_queue` receives
 // wake_word_event_type_t values: WAKE_WORD_DETECTED as WakeNet reports a
 // detection, and WAKE_WORD_SPEECH_END once speech following that detection
 // falls silent (see the enum comment above).
-esp_err_t wake_word_start(QueueHandle_t event_queue);
+//
+// `audio_frame_queue` (may be NULL if the caller doesn't need raw audio)
+// receives wake_word_audio_frame_t values -- see that struct's comment.
+// Frames are only produced while forwarding is armed via
+// wake_word_set_audio_forwarding(true); this is the single physical reader
+// of the mic (audio_pipeline_read() is called from nowhere else in the
+// component graph -- see wake_word.c file header comment item 6), so any
+// other consumer of the live mic stream (e.g. main.c's
+// server-audio-forwarding path during HARO_STATE_LISTENING) must go through
+// this queue rather than reading audio_pipeline directly.
+esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_queue);
+
+// Arms/disarms production of wake_word_audio_frame_t values onto
+// `audio_frame_queue` (see wake_word_start). Safe to call from any task;
+// takes effect on feed_task's next read. Frames are dropped (not queued,
+// and no allocation performed) while disarmed, so callers that don't
+// currently need the raw stream (e.g. outside HARO_STATE_LISTENING) should
+// disarm it rather than draining and discarding a queue.
+void wake_word_set_audio_forwarding(bool enable);
 
 #ifdef __cplusplus
 }
