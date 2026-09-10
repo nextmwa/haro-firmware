@@ -21,3 +21,14 @@ dependencies:
     version: ">=2.5.0"
     rules:
       - if: "target != linux"
+  # esp_websocket_client (part of espressif/esp-protocols) pulls in
+  # esp_http_client/tcp_transport/esp-tls, none of which target the "linux"
+  # preview target used by Task 1's host-test flow. Gate it the same way as
+  # esp_codec_dev/esp-sr above so `idf.py --preview set-target linux` keeps
+  # resolving; main/CMakeLists.txt and the root CMakeLists.txt's linux
+  # COMPONENTS list already exclude server_client (which REQUIRES
+  # esp_websocket_client) from the linux build.
+  espressif/esp_websocket_client:
+    version: "*"
+    rules:
+      - if: "target != linux"

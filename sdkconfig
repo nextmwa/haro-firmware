@@ -4113,6 +4113,15 @@ CONFIG_CODEC_TAS5805M_SUPPORT=y
 # default:
 # CONFIG_CODEC_DATA_ADC_SUPPORT is not set
 # end of Audio Codec Device Configuration
+
+#
+# ESP WebSocket client
+#
+# default:
+# CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER is not set
+# default:
+# CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK is not set
+# end of ESP WebSocket client
 # end of Component config
 
 # default:
