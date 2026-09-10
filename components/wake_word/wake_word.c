@@ -48,10 +48,19 @@
 //     confirmed present at managed_components/espressif__esp-sr/model/wakenet_model/wn9_hiesp
 //     and listed in wakeword_list.md) to make this concrete.
 //
-// VAD/end-of-speech detection is folded into `orchestrator`'s own silence
-// timer over the streamed audio (Task 8), per the brief -- `vad_state` is
-// available on the same `afe_fetch_result_t` if tighter coupling is wanted
-// later. This component only reports WAKE_WORD_DETECTED.
+//  5. (Task 10) End-of-speech: `afe_fetch_result_t.vad_state` is already
+//     computed on every fetch() call because `afe_config->vad_init = true`
+//     below, regardless of wakenet_init -- confirmed in esp_afe_sr_iface.h's
+//     struct doc comment ("vad_state: the value is afe_vad_state_t") and in
+//     esp_vad.h (`vad_state_t` = { VAD_SILENCE = 0, VAD_SPEECH = 1 }; the
+//     deprecated `afe_vad_state_t` alias in esp_afe_sr_iface.h carries the
+//     identical two values). detect_task() below tracks that field across
+//     fetches after a wake word fires and posts WAKE_WORD_SPEECH_END on the
+//     first VAD_SPEECH -> VAD_SILENCE transition it sees, requiring at least
+//     one VAD_SPEECH observation first so a wake word that fires mid-silence
+//     (vad_state already VAD_SILENCE right at detection, e.g. between the
+//     spoken wake phrase and the user's actual question) doesn't immediately
+//     end listening before any question audio arrives.
 #include "wake_word.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
@@ -60,6 +69,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 static const char *TAG = "wake_word";
 
@@ -106,6 +116,14 @@ static void feed_task(void *arg)
 static void detect_task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
+    // Set once a wake word fires, cleared once WAKE_WORD_SPEECH_END is
+    // posted for it -- gates end-of-speech tracking to "listening" periods.
+    bool awaiting_speech_end = false;
+    // Set the first time vad_state == VAD_SPEECH is observed while
+    // awaiting_speech_end is true; only after this do we treat a VAD_SILENCE
+    // reading as the end of speech (see file header comment item 5).
+    bool seen_speech = false;
+
     while (true) {
         afe_fetch_result_t *res = s_afe_handle->fetch(afe_data);
         if (res == NULL || res->ret_value == ESP_FAIL) {
@@ -116,6 +134,20 @@ static void detect_task(void *arg)
             ESP_LOGI(TAG, "wake word detected (word index %d)", res->wake_word_index);
             wake_word_event_type_t evt = WAKE_WORD_DETECTED;
             xQueueSend(s_event_queue, &evt, 0);
+            awaiting_speech_end = true;
+            seen_speech = false;
+        }
+
+        if (awaiting_speech_end) {
+            if (res->vad_state == VAD_SPEECH) {
+                seen_speech = true;
+            } else if (res->vad_state == VAD_SILENCE && seen_speech) {
+                ESP_LOGI(TAG, "speech end detected");
+                wake_word_event_type_t evt = WAKE_WORD_SPEECH_END;
+                xQueueSend(s_event_queue, &evt, 0);
+                awaiting_speech_end = false;
+                seen_speech = false;
+            }
         }
     }
 }
