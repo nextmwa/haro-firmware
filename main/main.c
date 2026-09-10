@@ -194,8 +194,16 @@ void app_main(void)
     // worth of slack before a frame would be dropped as "queue full".
     s_audio_frame_queue = xQueueCreate(8, sizeof(wake_word_audio_frame_t));
 
-    ESP_ERROR_CHECK(server_client_init(server_url, s_server_queue));
-    ESP_ERROR_CHECK(server_client_send_hello("haro-session"));
+    // server_client_init() only starts the WebSocket client's internal task
+    // (esp_websocket_client_start() does not block until connected) --
+    // sending the protocol `hello` message happens inside server_client.c
+    // itself, from its WEBSOCKET_EVENT_CONNECTED handler, once a real
+    // connection exists. See server_client.h for why there is no separate
+    // "send hello" call here (Finding 2 of the final review: this used to
+    // be a synchronous server_client_send_hello() call right here, which was
+    // guaranteed to fail on every boot since the WebSocket cannot possibly
+    // be connected yet at this point).
+    ESP_ERROR_CHECK(server_client_init(server_url, "haro-session", s_server_queue));
     ESP_ERROR_CHECK(wake_word_start(s_wake_queue, s_audio_frame_queue));
 
     orchestrator_ops_t ops = {

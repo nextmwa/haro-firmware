@@ -47,6 +47,34 @@ static const char *TAG = "server_client";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_event_queue;
 
+// Set once by server_client_init() and read only from
+// websocket_event_handler() on WEBSOCKET_EVENT_CONNECTED -- the event
+// handler has no natural way to receive it as a parameter (it's an
+// esp_event callback with a fixed signature), so it's stashed here instead.
+#define MAX_SESSION_ID_LEN 64
+static char s_session_id[MAX_SESSION_ID_LEN];
+
+// Sends the protocol `hello` message. Only ever called from
+// websocket_event_handler() below, in response to a real
+// WEBSOCKET_EVENT_CONNECTED -- esp_websocket_client_send_text() (via
+// esp_websocket_client_send_with_exact_opcode()) checks
+// esp_websocket_client_is_connected() first and fails immediately if not
+// connected yet, so this must never be called unconditionally at boot
+// (that was Finding 2 of the final review: server_client_send_hello() used
+// to be called synchronously right after server_client_init(), before
+// esp_websocket_client_start()'s internally-spawned task could possibly
+// have connected).
+static esp_err_t send_hello(void)
+{
+    char *json = protocol_encode_hello(s_session_id);
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), portMAX_DELAY);
+    free(json);
+    return sent >= 0 ? ESP_OK : ESP_FAIL;
+}
+
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)handler_args;
@@ -95,6 +123,14 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         }
         break;
     }
+    case WEBSOCKET_EVENT_CONNECTED: {
+        ESP_LOGI(TAG, "WebSocket connected, sending hello (session=%s)", s_session_id);
+        esp_err_t err = send_hello();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to send hello: %s", esp_err_to_name(err));
+        }
+        break;
+    }
     case WEBSOCKET_EVENT_DISCONNECTED: {
         server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_DISCONNECTED };
         if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
@@ -107,9 +143,16 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     }
 }
 
-esp_err_t server_client_init(const char *url, QueueHandle_t event_queue)
+esp_err_t server_client_init(const char *url, const char *session_id, QueueHandle_t event_queue)
 {
     s_event_queue = event_queue;
+
+    if (session_id != NULL) {
+        strncpy(s_session_id, session_id, sizeof(s_session_id) - 1);
+        s_session_id[sizeof(s_session_id) - 1] = '\0';
+    } else {
+        s_session_id[0] = '\0';
+    }
 
     esp_websocket_client_config_t config = {
         .uri = url,
@@ -128,17 +171,6 @@ esp_err_t server_client_init(const char *url, QueueHandle_t event_queue)
     }
 
     return esp_websocket_client_start(s_client);
-}
-
-esp_err_t server_client_send_hello(const char *session_id)
-{
-    char *json = protocol_encode_hello(session_id);
-    if (json == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), portMAX_DELAY);
-    free(json);
-    return sent >= 0 ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t server_client_send_audio_frame(const uint8_t *data, size_t len)
