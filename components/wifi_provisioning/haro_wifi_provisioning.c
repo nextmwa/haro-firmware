@@ -131,8 +131,22 @@ esp_err_t wifi_provisioning_ensure_connected(void)
     wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
 
+    // Deliberately NOT registering our own WIFI_EVENT handler here: while
+    // provisioning is active, network_prov_mgr_init() (below) registers its
+    // own internal WIFI_EVENT handler
+    // (managed_components/espressif__network_provisioning/src/manager.c:478)
+    // that owns the credential-connect/retry/give-up state machine. Adding
+    // our own unconditional WIFI_EVENT handler here would race it: it would
+    // fire a pointless esp_wifi_connect() on the initial
+    // WIFI_EVENT_STA_START (the manager has just erased STA config at that
+    // point), and it would blindly retry on every WIFI_EVENT_STA_DISCONNECTED
+    // during credential testing -- including a definitive auth failure the
+    // manager already decided not to retry. Espressif's own reference
+    // example (examples/wifi_prov/main/app_main.c) registers the app-level
+    // WIFI_EVENT handler ONLY in the already-provisioned branch below, after
+    // network_prov_mgr_deinit() -- never while the manager is active. We
+    // follow that exactly.
     ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
 
     network_prov_mgr_config_t config = {
@@ -155,8 +169,14 @@ esp_err_t wifi_provisioning_ensure_connected(void)
         // any existing credentials and forces SoftAP setup, even if already
         // provisioned (see network_prov_mgr_is_wifi_provisioned() doc in
         // network_provisioning/manager.h) -- so we must not call it here.
-        // Free the manager and drive WiFi STA directly instead.
+        // Free the manager and drive WiFi STA directly instead. Only now do
+        // we register our own WIFI_EVENT handler (matching
+        // examples/wifi_prov/main/app_main.c's wifi_init_sta() call site
+        // exactly: deinit manager, then register WIFI_EVENT, then set STA
+        // mode and start) -- the manager's internal WIFI_EVENT handler is
+        // gone once deinit'd, so there's no handler race here.
         ESP_ERROR_CHECK(network_prov_mgr_deinit());
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
     }
