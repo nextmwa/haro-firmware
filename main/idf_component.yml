@@ -32,3 +32,11 @@ dependencies:
     version: "*"
     rules:
       - if: "target != linux"
+  # network_provisioning depends on protocomm/protobuf components that are
+  # not built for the "linux" preview target used by Task 1/2/7's host-test
+  # flow. Gate it the same way as esp_codec_dev/esp-sr/esp_websocket_client
+  # above so `idf.py --preview set-target linux` keeps resolving.
+  espressif/network_provisioning:
+    version: "^1.1.0"
+    rules:
+      - if: "target != linux"

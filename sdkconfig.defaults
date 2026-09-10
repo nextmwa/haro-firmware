@@ -21,3 +21,12 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 # Kconfig.projbuild) -- without this, the model partition would be built
 # empty and wakenet_model_name would resolve to NULL at runtime.
 CONFIG_SR_WN_WN9_HIESP=y
+
+# network_provisioning (components/wifi_provisioning, Task 9): protocomm's
+# security version 1 (X25519 handshake + proof-of-possession) is disabled by
+# default -- only version 2 (SRP6a) ships enabled out of the box (see
+# esp-idf/components/protocomm/Kconfig). Task 9 uses NETWORK_PROV_SECURITY_1
+# per the brief, since it only needs a single shared proof-of-possession
+# string (matching the Pi's hotspot_password model) rather than SRP6a's
+# per-device salt/verifier provisioning story.
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
