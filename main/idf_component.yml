@@ -1,2 +1,12 @@
 dependencies:
   espressif/esp_codec_dev: ">=1.5.1"
+  # esp-sr's own manifest depends on espressif/esp-dl >=3.3.10, which has no
+  # version supporting the "linux" preview target (idf.py --preview
+  # set-target linux, used by Task 1's host-test flow / protocol's test/
+  # dir). Gate this dependency to real chip targets so `idf.py --preview
+  # set-target linux` keeps resolving; main/CMakeLists.txt already only adds
+  # `wake_word` (which REQUIRES esp-sr) to main_reqs outside the linux branch.
+  espressif/esp-sr:
+    version: ">=2.5.0"
+    rules:
+      - if: "target != linux"

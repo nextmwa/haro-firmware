@@ -3,3 +3,21 @@
 #
 # default:
 CONFIG_IDF_TARGET="esp32s3"
+
+# Custom partition table: adds the "model" SPIFFS partition ESP-SR packs its
+# WakeNet/AFE model data into (components/wake_word, Task 5).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ESP32-S3R8 module on this board has 16MB flash (see design spec); the
+# custom partition table above (nvs + 3M factory app + 5900K model) needs
+# more than the 2/4MB ESP-IDF default.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# ESP-SR (components/wake_word, Task 5): select the "Hi,ESP" WakeNet9 model
+# so esp_srmodel_filter(..., ESP_WN_PREFIX, "hiesp") actually finds a model
+# packed into the "model" partition at build time. All WakeNet models are
+# CONFIG_SR_WN_* = n by default (see managed_components/espressif__esp-sr's
+# Kconfig.projbuild) -- without this, the model partition would be built
+# empty and wakenet_model_name would resolve to NULL at runtime.
+CONFIG_SR_WN_WN9_HIESP=y
