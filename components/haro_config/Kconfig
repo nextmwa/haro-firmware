@@ -2,7 +2,7 @@ menu "Haro Config"
 
     config HARO_DEFAULT_SERVER_URL
         string "Default Haro server WebSocket URL"
-        default "ws://192.168.1.100:8765"
+        default "ws://10.0.0.126:8765"
         help
             Compile-time fallback server URL, used by
             haro_config_get_server_url() only when NVS has no "server_url"

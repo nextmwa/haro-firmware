@@ -40,3 +40,9 @@ dependencies:
     version: "^1.1.0"
     rules:
       - if: "target != linux"
+  # RMT-backed WS2812 driver for the 7-LED chain on GPIO38 (status_led
+  # component). Not linux-buildable (depends on the RMT peripheral driver).
+  espressif/led_strip:
+    version: "^3.0.0"
+    rules:
+      - if: "target != linux"
