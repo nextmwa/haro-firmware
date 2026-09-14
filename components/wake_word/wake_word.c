@@ -86,9 +86,11 @@
 #include "audio_pipeline.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static const char *TAG = "wake_word";
 
@@ -110,25 +112,62 @@ static volatile bool s_audio_forwarding_enabled;
 // partition rather than copy.
 static srmodel_list_t *s_models;
 
+// Backing state for wake_word_get_sound_direction() -- see wake_word.h for
+// the contract. Written every chunk from feed_task, read from whatever task
+// wants a "look toward sound" cue (main.c's orchestrator_task); int64_t
+// isn't word-aligned-safe as a plain volatile on a 32-bit MCU, hence
+// explicit atomics here rather than this file's usual volatile-bool pattern.
+#define SOUND_DIRECTION_LOUD_THRESHOLD 1500 // peak sample magnitude (of 32767) to count as "a loud sound" -- normal speech at ~20-30cm peaked in the 1000-8000 range on real hardware
+#define SOUND_DIRECTION_STALE_MS 1500
+static _Atomic float s_sound_direction;
+static _Atomic int64_t s_sound_last_loud_us;
+
+bool wake_word_get_sound_direction(float *direction)
+{
+    int64_t last_loud = atomic_load(&s_sound_last_loud_us);
+    if (last_loud == 0 || esp_timer_get_time() - last_loud > (int64_t)SOUND_DIRECTION_STALE_MS * 1000) {
+        return false;
+    }
+    *direction = atomic_load(&s_sound_direction);
+    return true;
+}
+
 void wake_word_set_audio_forwarding(bool enable)
 {
     s_audio_forwarding_enabled = enable;
 }
 
+// audio_pipeline's codec is opened with 2 hardware channels regardless of
+// how many channels AFE is fed (see audio_pipeline.c's init_mic_codec(),
+// fs.channel = 2) -- the I2S/TDM capture geometry doesn't change just
+// because AFE's afe_config_init() string below is "M" (1 mic channel, BSS
+// bypassed) rather than "MM" (2-mic BSS/beamforming). "M" is the confirmed
+// setting on real hardware: "MM"'s BSS stage assumes a specific mic array
+// geometry, and on this board it degraded detection rather than helping it
+// (wake word did not reliably trigger until switched to "M" + the ES7210
+// gain fix in audio_pipeline.c's init_mic_codec()). feed_task reads full
+// 2-channel hardware frames and extracts just channel 0 before handing
+// samples to AFE, so the hardware read size must stay independent of AFE's
+// (smaller) feed channel
+// count.
+#define HW_CHANNELS 2
+
 static void feed_task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
     int chunk_size = s_afe_handle->get_feed_chunksize(afe_data);   // samples per channel
-    int channels = s_afe_handle->get_feed_channel_num(afe_data);   // total feed channels ("MM" -> 2)
-    size_t frame_samples = (size_t)chunk_size * (size_t)channels;
-    size_t raw_bytes = frame_samples * sizeof(int32_t);
+    int afe_channels = s_afe_handle->get_feed_channel_num(afe_data);   // total feed channels ("M" -> 1)
+    size_t hw_frame_samples = (size_t)chunk_size * HW_CHANNELS;
+    size_t raw_bytes = hw_frame_samples * sizeof(int32_t);
+    size_t afe_frame_samples = (size_t)chunk_size * (size_t)afe_channels;
 
     // audio_pipeline's native format is 32-bit/sample (see file header
     // comment #3); AFE's feed() requires 16-bit/sample. Two buffers: one for
-    // the raw read, one truncated for AFE. `raw` is also the source data
-    // copied out to audio_frame_queue when forwarding is armed (item 6).
+    // the raw read (always HW_CHANNELS-wide), one truncated/channel-selected
+    // for AFE. `raw` is also the source data copied out to audio_frame_queue
+    // when forwarding is armed (item 6).
     int32_t *raw = heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
-    int16_t *pcm16 = heap_caps_malloc(frame_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *pcm16 = heap_caps_malloc(afe_frame_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (raw == NULL || pcm16 == NULL) {
         ESP_LOGE(TAG, "feed_task: buffer allocation failed");
         vTaskDelete(NULL);
@@ -143,13 +182,46 @@ static void feed_task(void *arg)
             continue;
         }
 
+        int16_t chunk_peak[HW_CHANNELS] = { 0, 0 };
+        for (size_t i = 0; i < hw_frame_samples; i++) {
+            int16_t sample16 = (int16_t)(raw[i] >> 16);
+            int ch = (int)(i % HW_CHANNELS);
+            int16_t mag = (sample16 < 0) ? (int16_t)(-sample16) : sample16;
+            if (mag > chunk_peak[ch]) chunk_peak[ch] = mag;
+
+            if (ch == 0) {
+                pcm16[i / HW_CHANNELS] = sample16;   // AFE gets hardware channel 0 only
+            }
+        }
+
+        // Sound-direction cue for the "look toward sound" idle behavior --
+        // see wake_word_get_sound_direction()'s comment above. Updated every
+        // chunk (~tens of ms).
+        if (chunk_peak[0] >= SOUND_DIRECTION_LOUD_THRESHOLD || chunk_peak[1] >= SOUND_DIRECTION_LOUD_THRESHOLD) {
+            float total = (float)chunk_peak[0] + (float)chunk_peak[1];
+            float direction = (total > 0.0f) ? ((float)chunk_peak[1] - (float)chunk_peak[0]) / total : 0.0f;
+            atomic_store(&s_sound_direction, direction);
+            atomic_store(&s_sound_last_loud_us, esp_timer_get_time());
+        }
+
+        // Found on real hardware: the server's STT decodes incoming audio
+        // as 16-bit mono PCM (haro_server/stt.py's _bytes_to_float32 does
+        // np.frombuffer(..., dtype=np.int16)) -- forwarding `raw` here (this
+        // board's native 32-bit/2-channel capture format) sent 4x too many
+        // bytes per sample-frame with a completely different bit layout,
+        // which the server silently misdecoded as noise. Every real turn
+        // came back "empty transcript, skipping LLM/TTS turn" as a result.
+        // `pcm16` above is already exactly the wire format the server
+        // expects (16-bit, single channel, same 16kHz capture rate) --
+        // forward a copy of THAT instead of `raw`.
         if (s_audio_frame_queue != NULL && s_audio_forwarding_enabled) {
-            uint8_t *copy = heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
+            size_t pcm16_bytes = afe_frame_samples * sizeof(int16_t);
+            uint8_t *copy = heap_caps_malloc(pcm16_bytes, MALLOC_CAP_SPIRAM);
             if (copy == NULL) {
                 ESP_LOGW(TAG, "feed_task: audio frame forward alloc failed, dropping frame");
             } else {
-                memcpy(copy, raw, raw_bytes);
-                wake_word_audio_frame_t frame = { .data = copy, .len = raw_bytes };
+                memcpy(copy, pcm16, pcm16_bytes);
+                wake_word_audio_frame_t frame = { .data = copy, .len = pcm16_bytes };
                 if (xQueueSend(s_audio_frame_queue, &frame, 0) != pdTRUE) {
                     ESP_LOGW(TAG, "feed_task: audio_frame_queue full, dropping frame");
                     heap_caps_free(copy);
@@ -157,12 +229,22 @@ static void feed_task(void *arg)
             }
         }
 
-        for (size_t i = 0; i < frame_samples; i++) {
-            pcm16[i] = (int16_t)(raw[i] >> 16);
-        }
         s_afe_handle->feed(afe_data, pcm16);
     }
 }
+
+// Found on real hardware: speech-end fired on the very first VAD_SILENCE
+// reading after any speech at all, which is far too trigger-happy for
+// natural speech -- a brief pause right after the wake word (before the
+// user's actual question even starts) was enough to end listening and
+// forward almost nothing, reliably producing an empty STT transcript. A
+// real end-of-speech detector needs SUSTAINED silence, not a single silent
+// frame, so normal pauses (after the wake word, mid-sentence) don't get
+// mistaken for "done talking". 700ms is a common voice-assistant
+// trailing-silence threshold: long enough to survive a natural breath,
+// short enough not to make the device feel unresponsive once the user
+// really has finished.
+#define SPEECH_END_SILENCE_MS 700
 
 static void detect_task(void *arg)
 {
@@ -171,9 +253,15 @@ static void detect_task(void *arg)
     // posted for it -- gates end-of-speech tracking to "listening" periods.
     bool awaiting_speech_end = false;
     // Set the first time vad_state == VAD_SPEECH is observed while
-    // awaiting_speech_end is true; only after this do we treat a VAD_SILENCE
-    // reading as the end of speech (see file header comment item 5).
+    // awaiting_speech_end is true; only after this do we treat VAD_SILENCE
+    // as (possibly) the end of speech (see file header comment item 5).
     bool seen_speech = false;
+    // Tracks an in-progress run of continuous VAD_SILENCE, so a single
+    // silent frame can't fire speech-end on its own -- only
+    // SPEECH_END_SILENCE_MS of *unbroken* silence can. Any VAD_SPEECH
+    // frame resets this (see the vad_state == VAD_SPEECH branch below).
+    bool in_silence = false;
+    int64_t silence_start_us = 0;
 
     while (true) {
         afe_fetch_result_t *res = s_afe_handle->fetch(afe_data);
@@ -189,19 +277,28 @@ static void detect_task(void *arg)
             }
             awaiting_speech_end = true;
             seen_speech = false;
+            in_silence = false;
         }
 
         if (awaiting_speech_end) {
             if (res->vad_state == VAD_SPEECH) {
                 seen_speech = true;
+                in_silence = false;
             } else if (res->vad_state == VAD_SILENCE && seen_speech) {
-                ESP_LOGI(TAG, "speech end detected");
-                wake_word_event_type_t evt = WAKE_WORD_SPEECH_END;
-                if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
-                    ESP_LOGW(TAG, "event_queue full, dropped WAKE_WORD_SPEECH_END");
+                int64_t now_us = esp_timer_get_time();
+                if (!in_silence) {
+                    in_silence = true;
+                    silence_start_us = now_us;
+                } else if (now_us - silence_start_us >= (int64_t)SPEECH_END_SILENCE_MS * 1000) {
+                    ESP_LOGI(TAG, "speech end detected");
+                    wake_word_event_type_t evt = WAKE_WORD_SPEECH_END;
+                    if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+                        ESP_LOGW(TAG, "event_queue full, dropped WAKE_WORD_SPEECH_END");
+                    }
+                    awaiting_speech_end = false;
+                    seen_speech = false;
+                    in_silence = false;
                 }
-                awaiting_speech_end = false;
-                seen_speech = false;
             }
         }
     }
@@ -230,7 +327,9 @@ esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_q
     }
     ESP_LOGI(TAG, "using WakeNet model: %s", wakenet_model_name);
 
-    afe_config_t *afe_config = afe_config_init("MM", s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    // TEMPORARY "M" (mono, single-channel, no BSS) instead of "MM" (2-mic
+    // BSS/beamforming) -- see feed_task's file header comment for why.
+    afe_config_t *afe_config = afe_config_init("M", s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (afe_config == NULL) {
         ESP_LOGE(TAG, "afe_config_init failed");
         esp_srmodel_deinit(s_models);

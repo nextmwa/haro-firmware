@@ -62,6 +62,18 @@ esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_q
 // disarm it rather than draining and discarding a queue.
 void wake_word_set_audio_forwarding(bool enable);
 
+// Coarse "which mic channel is louder" estimate, for a decorative
+// look-toward-sound effect -- NOT real sound localization. Returns true and
+// fills *direction with a normalized value in [-1, 1] (sign convention:
+// negative = hardware channel 0 louder, positive = channel 1 louder; this
+// board's physical mic-to-channel layout was never confirmed against a
+// datasheet, so treat the sign as "a direction", not a verified left/right)
+// if a sufficiently loud transient was seen within the last couple of
+// seconds. Returns false (do not use *direction) otherwise, e.g. during
+// quiet/ambient audio. Safe to call from any task; backed by feed_task's
+// existing per-frame amplitude tracking, no extra CPU cost.
+bool wake_word_get_sound_direction(float *direction);
+
 #ifdef __cplusplus
 }
 #endif
