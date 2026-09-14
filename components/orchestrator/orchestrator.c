@@ -4,10 +4,21 @@
 static orchestrator_ops_t s_ops;
 static haro_state_t s_state = HARO_STATE_IDLE;
 
-// Must match face_display.h's Expression enum values (Task 8) once wired in main.c;
-// duplicated here only as plain ints so this component doesn't need to depend on face_display.
-enum { EXPR_IDLE, EXPR_LISTENING, EXPR_THINKING, EXPR_SPEAKING_HAPPY, EXPR_SPEAKING_SAD,
-       EXPR_SPEAKING_CONFUSED, EXPR_SPEAKING_NEUTRAL, EXPR_ERROR, EXPR_SETUP };
+// Must match face_display.h's face_expression_t values exactly; duplicated
+// here only as plain ints so this component doesn't need to depend on
+// face_display. Each entry carries its own explicit `= N` (matching that
+// header's ordinals) rather than relying on declaration order -- that
+// header only ever appends new values, but pinning the numbers here too
+// means a future reordering on either side fails loud (mismatched values)
+// instead of silently desyncing.
+enum {
+    EXPR_IDLE = 0, EXPR_LISTENING = 1, EXPR_THINKING = 2, EXPR_SPEAKING_HAPPY = 3, EXPR_SPEAKING_SAD = 4,
+    EXPR_SPEAKING_CONFUSED = 5, EXPR_SPEAKING_NEUTRAL = 6, EXPR_ERROR = 7, EXPR_SETUP = 8,
+    // 9-11 (EXPR_BORED/EXPR_LOOKING_LEFT/EXPR_LOOKING_RIGHT) have no
+    // orchestrator-side use -- main.c's idle animation calls
+    // face_display_show() with them directly.
+    EXPR_ANGRY = 12, EXPR_DISGUSTED = 13, EXPR_SURPRISED = 14, EXPR_FEARFUL = 15,
+};
 
 void orchestrator_init(orchestrator_ops_t ops)
 {
@@ -45,6 +56,13 @@ static int expression_for_emotion(const char *value)
     if (strcmp(value, "happy") == 0) return EXPR_SPEAKING_HAPPY;
     if (strcmp(value, "sad") == 0) return EXPR_SPEAKING_SAD;
     if (strcmp(value, "confused") == 0) return EXPR_SPEAKING_CONFUSED;
+    // Newer tags matching face_display's Anki Cozmo mood reference; the
+    // Python server's emotion vocabulary doesn't send these yet as of this
+    // change, but the firmware side is ready for them.
+    if (strcmp(value, "angry") == 0) return EXPR_ANGRY;
+    if (strcmp(value, "disgusted") == 0) return EXPR_DISGUSTED;
+    if (strcmp(value, "surprised") == 0) return EXPR_SURPRISED;
+    if (strcmp(value, "fearful") == 0) return EXPR_FEARFUL;
     return EXPR_SPEAKING_NEUTRAL;
 }
 

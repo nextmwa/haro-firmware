@@ -5,12 +5,15 @@
 #include "esp_lcd_panel_ssd1306.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
 
-#define GPIO_DISPLAY_SDA GPIO_NUM_8
-#define GPIO_DISPLAY_SCL GPIO_NUM_9
+// Physically GPIO11 (SDA) / GPIO10 (SCL) -- see face_display.h's comment on
+// face_display_init() for why there's no GPIO_DISPLAY_SDA/SCL define here
+// anymore: those pins belong to audio_pipeline's shared bus, not this file.
 #define DISPLAY_I2C_ADDR 0x3C
 #define WIDTH 128
 #define HEIGHT 64
@@ -132,27 +135,55 @@ static void draw_eye(uint8_t *fb, int cx, int cy, int w, int h, int r, double an
     }
 }
 
-static void draw_filled_circle(uint8_t *fb, int cx, int cy, int r)
+// Filled "upside-down U" / arch eye (classic Anki Cozmo "looking around"
+// eye shape): rounded dome on top, flat bottom, straight sides -- distinct
+// from draw_eye()'s pill shape, which is rounded at both ends. Solid fill,
+// not an outline.
+static bool point_in_arch_centered(double px, double py, double w, double h)
 {
-    for (int y = -r; y <= r; y++) {
-        for (int x = -r; x <= r; x++) {
-            if (x * x + y * y <= r * r) {
+    double hw = w / 2.0, hh = h / 2.0;
+    if (fabs(px) > hw || py > hh || py < -hh) {
+        return false;
+    }
+    if (py >= 0.0) {
+        return true; // lower half: plain rectangle
+    }
+    double nx = px / hw, ny = py / hh; // upper half: inside the top semi-ellipse
+    return (nx * nx + ny * ny) <= 1.0;
+}
+
+static void draw_eye_arch(uint8_t *fb, int cx, int cy, int w, int h)
+{
+    int hw = w / 2, hh = h / 2;
+    for (int y = -hh; y <= hh; y++) {
+        for (int x = -hw; x <= hw; x++) {
+            if (point_in_arch_centered(x, y, w, h)) {
                 set_pixel(fb, cx + x, cy + y);
             }
         }
     }
 }
 
-// Stroked circle outline (used for LISTENING's mouth: draw.ellipse(...,
-// outline=1, width=2)).
-static void draw_circle_outline(uint8_t *fb, int cx, int cy, int r, int width_px)
+// Mirror of the arch eye across its horizontal axis: flat bottom becomes
+// flat top, dome now faces down into a "\_/" crescent -- Cozmo's
+// content/happy eye shape (a filled smile-eye, not just a stroked arc).
+static void draw_eye_arch_up(uint8_t *fb, int cx, int cy, int w, int h)
 {
-    double half_w = width_px / 2.0;
-    int bound = r + width_px + 1;
-    for (int y = -bound; y <= bound; y++) {
-        for (int x = -bound; x <= bound; x++) {
-            double d = sqrt((double)(x * x + y * y));
-            if (fabs(d - r) <= half_w) {
+    int hw = w / 2, hh = h / 2;
+    for (int y = -hh; y <= hh; y++) {
+        for (int x = -hw; x <= hw; x++) {
+            if (point_in_arch_centered(x, -y, w, h)) {
+                set_pixel(fb, cx + x, cy + y);
+            }
+        }
+    }
+}
+
+static void draw_filled_circle(uint8_t *fb, int cx, int cy, int r)
+{
+    for (int y = -r; y <= r; y++) {
+        for (int x = -r; x <= r; x++) {
+            if (x * x + y * y <= r * r) {
                 set_pixel(fb, cx + x, cy + y);
             }
         }
@@ -183,50 +214,6 @@ static void draw_thick_line(uint8_t *fb, double x0, double y0, double x1, double
     }
 }
 
-// An arc (over an ellipse inscribed in bbox [x0,y0,x1,y1]) with small filled
-// circles ("caps") at both ends -- ports face_display.py's `_capped_arc()`.
-// Angle convention matches PIL/face_display.py's: 0 deg = +x axis (3
-// o'clock), increasing clockwise as displayed (since y grows downward).
-static void draw_capped_arc(uint8_t *fb, int x0, int y0, int x1, int y1, double start_deg, double end_deg, int width_px)
-{
-    double cx = (x0 + x1) / 2.0, cy = (y0 + y1) / 2.0;
-    double rx = (x1 - x0) / 2.0, ry = (y1 - y0) / 2.0;
-    double r = width_px / 2.0;
-    int ir = (int)ceil(r);
-    double span = end_deg - start_deg;
-    double avg_r = (fabs(rx) + fabs(ry)) / 2.0;
-    double arc_len_est = fabs(span) * M_PI / 180.0 * avg_r;
-    int steps = (int)ceil(arc_len_est * 2.0) + 2;
-    for (int i = 0; i <= steps; i++) {
-        double t = start_deg + span * ((double)i / steps);
-        double rad = t * M_PI / 180.0;
-        double px = cx + rx * cos(rad), py = cy + ry * sin(rad);
-        int pcx = (int)lround(px), pcy = (int)lround(py);
-        for (int yy = -ir; yy <= ir; yy++) {
-            for (int xx = -ir; xx <= ir; xx++) {
-                if (xx * xx + yy * yy <= r * r) {
-                    set_pixel(fb, pcx + xx, pcy + yy);
-                }
-            }
-        }
-    }
-    int cap = width_px / 2;
-    if (cap < 1) {
-        cap = 1;
-    }
-    double angs[2] = { start_deg, end_deg };
-    for (int k = 0; k < 2; k++) {
-        double rad = angs[k] * M_PI / 180.0;
-        double px = cx + rx * cos(rad), py = cy + ry * sin(rad);
-        draw_filled_circle(fb, (int)lround(px), (int)lround(py), cap);
-    }
-}
-
-static void draw_eye_smile(uint8_t *fb, int cx, int cy, int w, int h, int width_px)
-{
-    draw_capped_arc(fb, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, 190.0, 350.0, width_px);
-}
-
 // A big "X" with capped corners, for the ERROR expression's eyes.
 static void draw_eye_x(uint8_t *fb, int cx, int cy, int r, int width_px)
 {
@@ -240,179 +227,247 @@ static void draw_eye_x(uint8_t *fb, int cx, int cy, int r, int width_px)
     }
 }
 
-// --- Minimal built-in 5x7 bitmap font, for SETUP's "SETUP" label ---------
-// No font/rendering library is pulled in; this is just the handful of
-// glyphs face_display.py's Expression.SETUP label needs.
+// --- Pose model --------------------------------------------------------
+//
+// Every expression is data -- a left eye and a right eye, each described by
+// a shape tag plus the numeric knobs that shape needs -- built once in
+// get_face_pose() below instead of drawn directly. This is what lets
+// face_display_show() interpolate smoothly between two expressions (blend
+// the numeric fields frame-by-frame) instead of hard-cutting, and keeps
+// get_face_pose() itself a plain, side-effect-free table any future caller
+// (or test) can inspect without a framebuffer.
+//
+// No mouth: matches the real Anki Cozmo hardware this is modeled after,
+// whose face is two eyes on a screen and nothing else -- every mood reads
+// entirely from eye shape/position. An earlier version of this component
+// drew mouths (arc smiles/frowns, a dot-strip for THINKING, "SETUP" spelled
+// out in a tiny bitmap font); removed once real-hardware photos made clear
+// how off that was from the reference, taking draw_capped_arc(),
+// draw_circle_outline(), and the bitmap-font block with it.
+//
+// Socket centers (eye_cy, left_x, right_x) are NOT part of the pose --
+// they're fixed layout constants (see render_pose()) that every expression
+// shares; dx/dy below offset a shape from its socket
+// center for expressions that shift eyes around (EXPR_LOOKING_*).
 
-static const char *glyph_rows(char c, int row)
+typedef enum { EYE_PILL, EYE_ARCH_DOWN, EYE_ARCH_UP, EYE_CIRCLE, EYE_X } eye_shape_t;
+
+typedef struct {
+    eye_shape_t shape;
+    double w, h;      // bounding box
+    double radius;    // corner radius -- EYE_PILL only
+    double tilt_deg;  // EYE_PILL only
+    double dx, dy;    // offset from this eye's socket center
+} eye_pose_t;
+
+typedef struct {
+    eye_pose_t left, right;
+} face_pose_t;
+
+// Any two poses with matching shape tags interpolate continuously (all
+// numeric fields lerp together); a shape-tag mismatch can't be blended
+// geometrically (there's no continuous path from a circle to an "X"), so
+// render_pose() below snaps that part to its target the moment t reaches
+// 0.5 instead -- see the file header comment on face_display_show() for how
+// the two behaviors combine into one animation.
+
+static void get_face_pose(face_expression_t expression, face_pose_t *pose)
 {
-    static const char *const S[7] = { " ### ", "#   #", "#    ", " ### ", "    #", "#   #", " ### " };
-    static const char *const E[7] = { "#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#####" };
-    static const char *const T[7] = { "#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  " };
-    static const char *const U[7] = { "#   #", "#   #", "#   #", "#   #", "#   #", "#   #", " ### " };
-    static const char *const P[7] = { "#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#    " };
-    switch (c) {
-        case 'S': return S[row];
-        case 'E': return E[row];
-        case 'T': return T[row];
-        case 'U': return U[row];
-        case 'P': return P[row];
-        default: return "     ";
+    // Nominal sizes every case scales from -- NOT socket positions (see the
+    // pose-model comment above), just the baseline eye/mouth dimensions.
+    // Taller than wide with a modest corner radius (well under half the
+    // width) so EYE_PILL reads as a rounded rectangle, not the fully
+    // round-ended capsule a radius of min(w,h)/2 would give.
+    const double eye_w = WIDTH * 0.15;
+    const double eye_h = HEIGHT * 0.42;
+    const double eye_radius = eye_w * 0.3;
+
+    eye_pose_t plain_eye = { .shape = EYE_PILL, .w = eye_w, .h = eye_h, .radius = eye_radius };
+
+    // Defaults: EXPR_IDLE's look. Every case below overrides only what it
+    // needs to change, the same way the old switch's fallthrough default
+    // worked.
+    pose->left = plain_eye;
+    pose->right = plain_eye;
+
+    switch (expression) {
+    case EXPR_SPEAKING_HAPPY:
+        // Filled content/happy crescents (Cozmo reference sheet's "Happy"
+        // row) -- same EYE_ARCH_UP primitive EXPR_LOOKING_* uses for its
+        // arch, mirrored.
+        pose->left = pose->right = (eye_pose_t){ .shape = EYE_ARCH_UP, .w = eye_w + 4, .h = eye_h * 0.7 };
+        break;
+
+    case EXPR_SPEAKING_SAD:
+        pose->left = (eye_pose_t){ .shape = EYE_PILL, .w = eye_w, .h = eye_h, .radius = eye_radius, .tilt_deg = -22 };
+        pose->right = (eye_pose_t){ .shape = EYE_PILL, .w = eye_w, .h = eye_h, .radius = eye_radius, .tilt_deg = 22 };
+        break;
+
+    case EXPR_SPEAKING_CONFUSED:
+        pose->left = plain_eye;
+        pose->right = (eye_pose_t){
+            .shape = EYE_PILL, .w = eye_w, .h = eye_h, .radius = eye_radius, .tilt_deg = 22, .dy = -eye_h * 0.38,
+        };
+        break;
+
+    case EXPR_THINKING:
+        pose->left = pose->right = (eye_pose_t){
+            .shape = EYE_PILL, .w = eye_w, .h = eye_h * 0.6, .radius = eye_h * 0.6 / 3.0, .tilt_deg = -18,
+        };
+        break;
+
+    case EXPR_ERROR:
+        pose->left = pose->right = (eye_pose_t){ .shape = EYE_X, .w = eye_w / 2.0, .h = eye_w / 8.0 < 2 ? 2 : eye_w / 8.0 };
+        break;
+
+    case EXPR_SETUP:
+        pose->left = pose->right = (eye_pose_t){ .shape = EYE_CIRCLE, .w = eye_h / 5.0 < 2 ? 4 : eye_h / 2.5 };
+        break;
+
+    case EXPR_LISTENING:
+        pose->left = pose->right = (eye_pose_t){
+            .shape = EYE_PILL, .w = eye_w * 1.05, .h = eye_h * 1.25, .radius = eye_radius,
+        };
+        break;
+
+    case EXPR_SPEAKING_NEUTRAL:
+        break; // plain_eye already set as the default above
+
+    case EXPR_BORED:
+        pose->left = pose->right = (eye_pose_t){
+            .shape = EYE_PILL, .w = eye_w, .h = eye_h * 0.3, .radius = eye_h * 0.3 / 2.0, .dy = 4,
+        };
+        break;
+
+    case EXPR_LOOKING_LEFT:
+    case EXPR_LOOKING_RIGHT: {
+        double shift = (expression == EXPR_LOOKING_LEFT) ? -eye_w / 3.0 : eye_w / 3.0;
+        pose->left = pose->right = (eye_pose_t){ .shape = EYE_ARCH_DOWN, .w = eye_w, .h = eye_h * 0.75, .dx = shift };
+        break;
+    }
+
+    // --- New moods, added against the Anki Cozmo reference sheet ---
+
+    case EXPR_ANGRY:
+        // Sharp, thin brows angled inward-down toward the nose (mirror of
+        // SAD's outward-down droop: signs flipped, flatter/thinner, small
+        // radius for a hard edge rather than a soft pill).
+        pose->left = (eye_pose_t){ .shape = EYE_PILL, .w = eye_w, .h = eye_h * 0.45, .radius = 2, .tilt_deg = 28 };
+        pose->right = (eye_pose_t){ .shape = EYE_PILL, .w = eye_w, .h = eye_h * 0.45, .radius = 2, .tilt_deg = -28 };
+        break;
+
+    case EXPR_DISGUSTED:
+        // Asymmetric, matching the reference: one eye stays open (flat
+        // pill), the other squints into a downward arch, as if recoiling
+        // to one side.
+        pose->left = plain_eye;
+        pose->right = (eye_pose_t){ .shape = EYE_ARCH_DOWN, .w = eye_w, .h = eye_h * 0.4, .dy = eye_h * 0.15 };
+        break;
+
+    case EXPR_SURPRISED:
+        // Big wide-open circles (reference sheet's "Surprised" row).
+        pose->left = pose->right = (eye_pose_t){ .shape = EYE_CIRCLE, .w = eye_h * 0.6 };
+        break;
+
+    case EXPR_FEARFUL:
+        // Wide-open, pulled-apart eyes: taller than plain, pushed outward
+        // via dx.
+        pose->left = (eye_pose_t){ .shape = EYE_PILL, .w = eye_w * 0.85, .h = eye_h * 1.15, .radius = eye_radius, .dx = -eye_w * 0.15 };
+        pose->right = (eye_pose_t){ .shape = EYE_PILL, .w = eye_w * 0.85, .h = eye_h * 1.15, .radius = eye_radius, .dx = eye_w * 0.15 };
+        break;
+
+    case EXPR_IDLE:
+    default:
+        break; // pose already holds EXPR_IDLE's look (plain_eye)
     }
 }
 
-static void draw_char(uint8_t *fb, int x, int y, char c)
+// --- Rendering: turns one face_pose_t into pixels -----------------------
+
+static void render_eye(uint8_t *fb, int socket_cx, int socket_cy, const eye_pose_t *p)
 {
-    for (int row = 0; row < 7; row++) {
-        const char *r = glyph_rows(c, row);
-        for (int col = 0; col < 5; col++) {
-            if (r[col] == '#') {
-                set_pixel(fb, x + col, y + row);
-            }
-        }
+    int cx = socket_cx + (int)lround(p->dx);
+    int cy = socket_cy + (int)lround(p->dy);
+    int w = (int)lround(p->w), h = (int)lround(p->h);
+    switch (p->shape) {
+    case EYE_PILL:
+        draw_eye(fb, cx, cy, w, h, (int)lround(p->radius), p->tilt_deg);
+        break;
+    case EYE_ARCH_DOWN:
+        draw_eye_arch(fb, cx, cy, w, h);
+        break;
+    case EYE_ARCH_UP:
+        draw_eye_arch_up(fb, cx, cy, w, h);
+        break;
+    case EYE_CIRCLE:
+        draw_filled_circle(fb, cx, cy, w > 1 ? w / 2 : 1);
+        break;
+    case EYE_X:
+        draw_eye_x(fb, cx, cy, w, h > 1 ? h : 2);
+        break;
     }
 }
 
-static void draw_text(uint8_t *fb, int x, int y, const char *text)
-{
-    int cx = x;
-    for (const char *p = text; *p; p++) {
-        draw_char(fb, cx, y, *p);
-        cx += 6; // 5px glyph + 1px spacing
-    }
-}
-
-// --- Public API ------------------------------------------------------------
-
-void face_display_render(face_expression_t expression, uint8_t *framebuffer)
+// Renders `pose` into `framebuffer`, blending toward `target`'s shape at
+// t=0.5 for either eye whose shape tag doesn't match `pose`'s own (see the
+// pose-model comment above) -- t is where this frame sits in an
+// in-progress animation (1.0 for a static, non-animated render).
+static void render_pose(const face_pose_t *pose, const face_pose_t *target, double t, uint8_t *framebuffer)
 {
     memset(framebuffer, 0, WIDTH * HEIGHT / 8);
 
     // Layout constants, mirroring face_display.py's render_expression().
     const int eye_cy = (int)(HEIGHT * 0.38);
-    const int eye_w = (int)(WIDTH * 0.20);
-    const int eye_h = (int)(HEIGHT * 0.32);
-    int eye_radius = (eye_w < eye_h ? eye_w : eye_h) / 2; // pill-shaped ends, Cozmo's "leaf" eye
     const int left_x = (int)(WIDTH * 0.30);
     const int right_x = (int)(WIDTH * 0.70);
 
-    const int mouth_cy = (int)(HEIGHT * 0.78);
-    const int mouth_half_w = (int)(WIDTH * 0.18);
-    const int mouth_cx = WIDTH / 2;
+    const eye_pose_t *left = (pose->left.shape == target->left.shape || t < 0.5) ? &pose->left : &target->left;
+    const eye_pose_t *right = (pose->right.shape == target->right.shape || t < 0.5) ? &pose->right : &target->right;
 
-    switch (expression) {
-    case EXPR_SPEAKING_HAPPY:
-        draw_eye_smile(framebuffer, left_x, eye_cy, eye_w + 4, eye_h, 3);
-        draw_eye_smile(framebuffer, right_x, eye_cy, eye_w + 4, eye_h, 3);
-        draw_capped_arc(framebuffer, mouth_cx - mouth_half_w, mouth_cy - 14,
-                         mouth_cx + mouth_half_w, mouth_cy + 10, 15.0, 165.0, 3);
-        break;
-
-    case EXPR_SPEAKING_SAD:
-        draw_eye(framebuffer, left_x, eye_cy, eye_w, eye_h, eye_radius, -22.0);
-        draw_eye(framebuffer, right_x, eye_cy, eye_w, eye_h, eye_radius, 22.0);
-        draw_capped_arc(framebuffer, mouth_cx - mouth_half_w, mouth_cy,
-                         mouth_cx + mouth_half_w, mouth_cy + 22, 200.0, 340.0, 3);
-        break;
-
-    case EXPR_SPEAKING_CONFUSED: {
-        draw_eye(framebuffer, left_x, eye_cy, eye_w, eye_h, eye_radius, 0.0);
-        draw_eye(framebuffer, right_x, (int)(eye_cy * 0.8), eye_w, eye_h, eye_radius, 22.0);
-        int third = mouth_half_w / 3;
-        double pts[4][2] = {
-            { (double)(mouth_cx - mouth_half_w), (double)mouth_cy },
-            { (double)(mouth_cx - third), (double)(mouth_cy + 7) },
-            { (double)(mouth_cx + third), (double)(mouth_cy - 7) },
-            { (double)(mouth_cx + mouth_half_w), (double)mouth_cy },
-        };
-        for (int i = 0; i < 3; i++) {
-            draw_thick_line(framebuffer, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], 3);
-        }
-        break;
-    }
-
-    case EXPR_THINKING: {
-        int think_h = (int)(eye_h * 0.6);
-        int think_radius = (eye_w < think_h ? eye_w : think_h) / 3;
-        draw_eye(framebuffer, left_x, eye_cy, eye_w, think_h, think_radius, -18.0);
-        draw_eye(framebuffer, right_x, eye_cy, eye_w, think_h, think_radius, -18.0);
-        int dot_r = HEIGHT / 20;
-        if (dot_r < 2) {
-            dot_r = 2;
-        }
-        for (int step = -1; step <= 1; step++) {
-            int dx = mouth_cx + step * dot_r * 3;
-            draw_filled_circle(framebuffer, dx, mouth_cy, dot_r);
-        }
-        break;
-    }
-
-    case EXPR_ERROR: {
-        int x_width = eye_w / 8;
-        if (x_width < 2) {
-            x_width = 2;
-        }
-        draw_eye_x(framebuffer, left_x, eye_cy, eye_w / 2, x_width);
-        draw_eye_x(framebuffer, right_x, eye_cy, eye_w / 2, x_width);
-        draw_rounded_rect(framebuffer, mouth_cx, mouth_cy, mouth_half_w, 4, 2);
-        break;
-    }
-
-    case EXPR_SETUP: {
-        int dot_r = eye_h / 5;
-        if (dot_r < 2) {
-            dot_r = 2;
-        }
-        draw_filled_circle(framebuffer, left_x, eye_cy, dot_r);
-        draw_filled_circle(framebuffer, right_x, eye_cy, dot_r);
-        draw_text(framebuffer, mouth_cx - 20, mouth_cy - 6, "SETUP");
-        break;
-    }
-
-    case EXPR_LISTENING: {
-        int w = (int)(eye_w * 1.05), h = (int)(eye_h * 1.25);
-        draw_eye(framebuffer, left_x, eye_cy, w, h, eye_radius, 0.0);
-        draw_eye(framebuffer, right_x, eye_cy, w, h, eye_radius, 0.0);
-        int r = HEIGHT / 16;
-        if (r < 2) {
-            r = 2;
-        }
-        draw_circle_outline(framebuffer, mouth_cx, mouth_cy, r, 2);
-        break;
-    }
-
-    case EXPR_SPEAKING_NEUTRAL: {
-        draw_eye(framebuffer, left_x, eye_cy, eye_w, eye_h, eye_radius, 0.0);
-        draw_eye(framebuffer, right_x, eye_cy, eye_w, eye_h, eye_radius, 0.0);
-        int mouth_r = HEIGHT / 10;
-        if (mouth_r < 3) {
-            mouth_r = 3;
-        }
-        draw_rounded_rect(framebuffer, mouth_cx, mouth_cy, mouth_half_w, mouth_r * 2, mouth_r);
-        break;
-    }
-
-    case EXPR_IDLE:
-    default:
-        draw_eye(framebuffer, left_x, eye_cy, eye_w, eye_h, eye_radius, 0.0);
-        draw_eye(framebuffer, right_x, eye_cy, eye_w, eye_h, eye_radius, 0.0);
-        draw_rounded_rect(framebuffer, mouth_cx, mouth_cy, mouth_half_w, 4, 2);
-        break;
-    }
+    render_eye(framebuffer, left_x, eye_cy, left);
+    render_eye(framebuffer, right_x, eye_cy, right);
 }
 
-esp_err_t face_display_init(void)
+static double lerp(double a, double b, double t) { return a + (b - a) * t; }
+
+static eye_pose_t lerp_eye(const eye_pose_t *a, const eye_pose_t *b, double t)
 {
-    i2c_master_bus_handle_t bus;
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_NUM_1,
-        .sda_io_num = GPIO_DISPLAY_SDA,
-        .scl_io_num = GPIO_DISPLAY_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
+    // Only called with a->shape == b->shape (render_pose snaps mismatches
+    // itself); shape tag just carries over unchanged.
+    return (eye_pose_t){
+        .shape = a->shape,
+        .w = lerp(a->w, b->w, t), .h = lerp(a->h, b->h, t),
+        .radius = lerp(a->radius, b->radius, t), .tilt_deg = lerp(a->tilt_deg, b->tilt_deg, t),
+        .dx = lerp(a->dx, b->dx, t), .dy = lerp(a->dy, b->dy, t),
     };
-    esp_err_t err = i2c_new_master_bus(&bus_config, &bus);
+}
+
+// --- Public API ------------------------------------------------------------
+
+esp_err_t face_display_init(i2c_master_bus_handle_t i2c_bus)
+{
+    if (i2c_bus == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Probe for the display before touching esp_lcd's I2C transactions,
+    // which have no timeout: with no physical SSD1306 attached (or ACKing),
+    // the very first write in panel_ssd1306_init() blocks forever, hanging
+    // main_task until the FreeRTOS task watchdog fires and reboots the
+    // board (found on real hardware -- main.c used to skip calling this
+    // function entirely as a stopgap). i2c_master_probe() is the
+    // documented, bounded-timeout way to check device presence first
+    // (driver/i2c_master.h): it sends just the address with a write bit and
+    // returns ESP_OK on ACK, ESP_ERR_NOT_FOUND on NACK, or ESP_ERR_TIMEOUT
+    // if the bus itself is wedged -- all within xfer_timeout_ms, unlike the
+    // unbounded transactions below. This bus is shared with the onboard
+    // codecs (see face_display.h) and owned by audio_pipeline -- never
+    // deleted here even on failure.
+    esp_err_t err = i2c_master_probe(i2c_bus, DISPLAY_I2C_ADDR, 100);
     if (err != ESP_OK) {
-        return err;
+        ESP_LOGW(TAG, "no display found at I2C address 0x%02X (%s) -- skipping display init",
+                 DISPLAY_I2C_ADDR, esp_err_to_name(err));
+        return ESP_ERR_NOT_FOUND;
     }
 
     esp_lcd_panel_io_handle_t io_handle;
@@ -428,7 +483,7 @@ esp_err_t face_display_init(void)
         // field, not a compile error. 400kHz is SSD1306's standard Fast Mode.
         .scl_speed_hz = 400000,
     };
-    err = esp_lcd_new_panel_io_i2c(bus, &io_config, &io_handle);
+    err = esp_lcd_new_panel_io_i2c(i2c_bus, &io_config, &io_handle);
     if (err != ESP_OK) {
         return err;
     }
@@ -450,6 +505,20 @@ esp_err_t face_display_init(void)
     return esp_lcd_panel_disp_on_off(s_panel, true);
 }
 
+// Tracks what's currently on screen so the next face_display_show() call
+// knows what to animate FROM. s_has_current_pose starts false so the very
+// first call (e.g. main.c's post-init EXPR_IDLE) snaps straight to target
+// instead of animating in from an undefined pose.
+static face_pose_t s_current_pose;
+static bool s_has_current_pose;
+
+// Number of intermediate frames pushed between the previous expression and
+// the new one, and the delay between each. 8 steps * 25ms = ~200ms total --
+// fast enough to read as "fluid" rather than "slow", slow enough that a
+// side-glance or a smile visibly moves instead of just appearing.
+#define FACE_ANIM_STEPS 8
+#define FACE_ANIM_STEP_DELAY_MS 25
+
 esp_err_t face_display_show(face_expression_t expression)
 {
     // s_panel is NULL if face_display_init() was never called or never
@@ -458,6 +527,81 @@ esp_err_t face_display_show(face_expression_t expression)
     if (s_panel == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    face_display_render(expression, s_framebuffer);
+
+    face_pose_t target;
+    get_face_pose(expression, &target);
+
+    if (!s_has_current_pose) {
+        s_current_pose = target;
+        s_has_current_pose = true;
+        render_pose(&target, &target, 1.0, s_framebuffer);
+        return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+    }
+
+    face_pose_t from = s_current_pose;
+    esp_err_t err = ESP_OK;
+    for (int i = 1; i <= FACE_ANIM_STEPS; i++) {
+        double t = (double)i / FACE_ANIM_STEPS;
+        face_pose_t interp = {
+            .left = lerp_eye(&from.left, &target.left, t),
+            .right = lerp_eye(&from.right, &target.right, t),
+        };
+        render_pose(&interp, &target, t, s_framebuffer);
+        err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+        if (err != ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(FACE_ANIM_STEP_DELAY_MS));
+    }
+    s_current_pose = target;
+    return err;
+}
+
+// Both face_display_set_gaze_offset() and face_display_set_blink() are
+// transient visual nudges on top of whatever expression is showing -- they
+// share this last-known-overlay state and re-render together so a blink
+// mid-saccade (or vice versa) doesn't clobber the other's effect, matching
+// how a real one-shot call from either function looks on screen.
+static int s_overlay_dx_px, s_overlay_dy_px;
+static float s_overlay_blink = 1.0f; // 1.0 = fully open (default), 0.0 = fully closed
+
+static esp_err_t render_overlay(void)
+{
+    if (s_panel == NULL || !s_has_current_pose) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Deliberately does NOT touch s_current_pose: this overlay is a
+    // transient visual nudge on top of whatever's showing, not a change to
+    // the base pose face_display_show()'s next animation interpolates from.
+    face_pose_t overlay_pose = s_current_pose;
+    overlay_pose.left.dx += s_overlay_dx_px;
+    overlay_pose.left.dy += s_overlay_dy_px;
+    overlay_pose.right.dx += s_overlay_dx_px;
+    overlay_pose.right.dy += s_overlay_dy_px;
+
+    if (s_overlay_blink < 1.0f) {
+        // Clamp above 0 -- a literal 0px-tall shape degenerates the
+        // rounded-rect fill test (w/h ratio blows up), so floor it at a
+        // thin sliver instead of a fully collapsed line.
+        float openness = s_overlay_blink < 0.05f ? 0.05f : s_overlay_blink;
+        overlay_pose.left.h *= openness;
+        overlay_pose.right.h *= openness;
+    }
+
+    render_pose(&overlay_pose, &overlay_pose, 1.0, s_framebuffer);
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}
+
+esp_err_t face_display_set_gaze_offset(int dx_px, int dy_px)
+{
+    s_overlay_dx_px = dx_px;
+    s_overlay_dy_px = dy_px;
+    return render_overlay();
+}
+
+esp_err_t face_display_set_blink(float openness)
+{
+    s_overlay_blink = openness;
+    return render_overlay();
 }
