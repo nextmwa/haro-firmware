@@ -75,3 +75,7 @@ reconnect to the `Haro-Setup` SoftAP.
 - `components/orchestrator/` -- turn/state machine tying it together
 - `components/wifi_provisioning/` -- SoftAP provisioning wrapper
 - `components/haro_config/` -- Kconfig-backed runtime config
+
+## License
+
+[MIT](LICENSE)
