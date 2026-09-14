@@ -47,6 +47,28 @@ static const char *TAG = "server_client";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_event_queue;
 
+// Found on real hardware: TTS playback came out garbled/stuttering.
+// esp_websocket_client's receive buffer defaults to 1024 bytes
+// (WEBSOCKET_BUFFER_SIZE_BYTE in esp_websocket_client.c, not overridden by
+// server_client_init()'s config below), but a single TTS audio chunk from
+// the server (one Kokoro synthesis segment, tts.py's
+// KokoroTtsEngine._synthesize_sentence) easily runs to tens of KB -- far
+// past that. esp_websocket_client's own documented behavior for this case
+// (see esp_websocket_client.h's payload_len/payload_offset doc comments:
+// "payloads exceeding buffer will be posted through multiple events") is
+// to fire WEBSOCKET_EVENT_DATA once per ~1024-byte fragment of the SAME
+// logical message. The code below used to treat every one of those
+// fragments as its own complete, independent audio chunk -- shredding
+// every TTS reply into dozens of tiny out-of-context pieces (and,
+// separately, overflowing s_event_queue's depth of 8 in the process, since
+// what should have been a handful of real chunks became a hundred-plus
+// fragments). Reassemble fragments into one buffer per logical message
+// using payload_offset/payload_len instead, and only enqueue once a
+// message is complete.
+static uint8_t *s_audio_reassembly_buf;
+static size_t s_audio_reassembly_len;   // bytes written so far
+static size_t s_audio_reassembly_total; // expected total, from payload_len
+
 // Set once by server_client_init() and read only from
 // websocket_event_handler() on WEBSOCKET_EVENT_CONNECTED -- the event
 // handler has no natural way to receive it as a parameter (it's an
@@ -86,21 +108,42 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         if (data->data_len <= 0) {
             break;
         }
-        if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) { // binary: TTS audio chunk
-            uint8_t *audio_data = malloc(data->data_len);
-            if (audio_data == NULL) {
-                ESP_LOGE(TAG, "OOM allocating %d-byte audio chunk", data->data_len);
-                break;
+        if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) { // binary: TTS audio chunk (possibly fragmented -- see comment above)
+            if (data->payload_offset == 0) {
+                // Start of a new logical message. Free any previous
+                // reassembly buffer first -- normally NULL already (the
+                // completed branch below clears it), but a message that
+                // never reached its declared payload_len (e.g. a dropped
+                // fragment) would otherwise leak it here.
+                free(s_audio_reassembly_buf);
+                s_audio_reassembly_buf = NULL;
+                s_audio_reassembly_total = (size_t)data->payload_len;
+                s_audio_reassembly_len = 0;
+                if (s_audio_reassembly_total > 0) {
+                    s_audio_reassembly_buf = malloc(s_audio_reassembly_total);
+                    if (s_audio_reassembly_buf == NULL) {
+                        ESP_LOGE(TAG, "OOM allocating %u-byte audio reassembly buffer",
+                                 (unsigned)s_audio_reassembly_total);
+                    }
+                }
             }
-            memcpy(audio_data, data->data_ptr, data->data_len);
-            server_client_event_t evt = {
-                .type = SERVER_CLIENT_EVENT_AUDIO,
-                .audio_data = audio_data,
-                .audio_len = (size_t)data->data_len,
-            };
-            if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "event queue full, dropping audio chunk");
-                free(audio_data);
+            if (s_audio_reassembly_buf != NULL &&
+                (size_t)data->payload_offset == s_audio_reassembly_len &&
+                s_audio_reassembly_len + (size_t)data->data_len <= s_audio_reassembly_total) {
+                memcpy(s_audio_reassembly_buf + s_audio_reassembly_len, data->data_ptr, (size_t)data->data_len);
+                s_audio_reassembly_len += (size_t)data->data_len;
+            }
+            if (s_audio_reassembly_buf != NULL && s_audio_reassembly_len >= s_audio_reassembly_total) {
+                server_client_event_t evt = {
+                    .type = SERVER_CLIENT_EVENT_AUDIO,
+                    .audio_data = s_audio_reassembly_buf,
+                    .audio_len = s_audio_reassembly_len,
+                };
+                if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "event queue full, dropping audio chunk");
+                    free(s_audio_reassembly_buf);
+                }
+                s_audio_reassembly_buf = NULL; // ownership transferred to the queue (or freed just above)
             }
         } else if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) { // text: JSON control message
             char *text = malloc((size_t)data->data_len + 1);
