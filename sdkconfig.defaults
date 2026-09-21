@@ -14,13 +14,35 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # more than the 2/4MB ESP-IDF default.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
-# ESP-SR (components/wake_word, Task 5): select the "Hi,ESP" WakeNet9 model
-# so esp_srmodel_filter(..., ESP_WN_PREFIX, "hiesp") actually finds a model
-# packed into the "model" partition at build time. All WakeNet models are
+# ESP-SR (components/wake_word): select the "Hey,Kira" and "Hi,Wall,E"
+# WakeNet9 models so esp_srmodel_filter(..., ESP_WN_PREFIX, "heykira"/
+# "hiwalle") can find them packed into the "model" partition at build
+# time. Two, not one:
+# esp_afe_config_t has both wakenet_model_name (wakenet 1) and
+# wakenet_model_name_2 (wakenet 2) for exactly this -- running two WakeNet
+# models at once, distinguished at runtime by the detection result's
+# wake_word_index (already logged in wake_word.c). All WakeNet models are
 # CONFIG_SR_WN_* = n by default (see managed_components/espressif__esp-sr's
 # Kconfig.projbuild) -- without this, the model partition would be built
-# empty and wakenet_model_name would resolve to NULL at runtime.
-CONFIG_SR_WN_WN9_HIESP=y
+# empty and wakenet_model_name/_2 would resolve to NULL at runtime. Each
+# model is ~290KB (checked against the other options' file sizes) against a
+# 5900KB "model" partition, so two together is not a size concern the way
+# ESPDet's RAM footprint was (see camera_face_track's history).
+#
+# "Hey,Kira" + "Hi,Wall,E" (was "Jarvis" + "Alexa"; "Jarvis" + "Hey,GiGi"
+# was tried first and rejected -- see below): confirmed on real hardware
+# that pairing two WakeNet9 models only works if their internal hidden-
+# layer size matches -- each model's _MODEL_INFO_ file encodes this in its
+# name as "...h<N>..." (e.g. Hey,Kira and Hi,Wall,E are both "h12"; Jarvis
+# and Alexa were both "h8"; Hey,GiGi is "h18" -- none of these three sizes
+# interchange). Jarvis+Hey,GiGi crashed on every boot with `assert failed:
+# model_detect_mfcc wakenet9_quantized.c:1008 (cq->n == model->layers[0]->n)`
+# -- a real dimension mismatch inside the WakeNet library, not a config
+# mistake -- and kept crash-looping since nothing about the (persisted,
+# correct-looking) config changed between boots. Hey,Kira+Hi,Wall,E's
+# matching "h12" avoids this.
+CONFIG_SR_WN_WN9_HEYKIRA_TTS3=y
+CONFIG_SR_WN_WN9_HIWALLE_TTS2=y
 
 # network_provisioning (components/wifi_provisioning, Task 9): protocomm's
 # security version 1 (X25519 handshake + proof-of-possession) is disabled by
@@ -43,3 +65,41 @@ CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+
+# wifi_provisioning's "set_server_url" serial console (esp_console) needs
+# to receive typed input, not just print log output. This chip's Kconfig
+# default is primary console = UART0 (GPIO43/44) with USB-Serial-JTAG only
+# as a SECONDARY console -- and a secondary console is always output-only
+# (ESP-IDF's own console example warns about exactly this:
+# "examples/system/console/basic/main/console_example_main.c"). This
+# board's /dev/cu.usbmodemXXXX is the USB-Serial-JTAG peripheral, so with
+# the stock default every command typed over that port was silently
+# dropped -- confirmed on real hardware (esp_console_new_repl_stdio()
+# started fine, printed its banner, then never responded to any input,
+# not even "help"). Making USB-Serial-JTAG the PRIMARY console instead
+# fixes it; UART0 was never used for anything else in this project, so no
+# secondary console is needed.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# esp_websocket_client (components/server_client): found on real hardware,
+# root-caused by reading uvicorn's actual Config defaults (ws_ping_interval
+# =20.0, ws_ping_timeout=20.0 -- haro-server never overrides either) against
+# server_client.c's own source -- every WebSocket session was being closed
+# by the SERVER at a precise, repeated ~40s (20+20), not a network flake.
+# Without this option, esp_websocket_client_send_with_exact_opcode() (every
+# send in server_client.c) and the receive path that answers an incoming
+# PING with a PONG (esp_websocket_client.c's "if a PING message received ->
+# send out the PONG") share ONE lock (`client->lock`). server_client_send_
+# camera_frame() sends a base64 JPEG from its own task every 500ms with NO
+# timeout bound (portMAX_DELAY -- see NON_ORCHESTRATOR_SEND_TIMEOUT's
+# comment in server_client.c for why that bound had to be removed in the
+# first place, on this same slow network); while that send is in flight,
+# the shared lock is held, so an incoming PING sitting in the TCP receive
+# buffer can't even be parsed, let alone answered -- the PONG never goes
+# out, and uvicorn kills the "unresponsive" connection at the 40s mark on a
+# perfectly healthy link. This option gives sends their own `tx_lock`
+# (esp_websocket_client's own Kconfig help text: "avoid the lock contention
+# when send and receive data at the same time"), so a slow camera-frame
+# write no longer blocks answering the server's keepalive.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y

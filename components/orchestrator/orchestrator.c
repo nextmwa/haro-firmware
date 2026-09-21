@@ -33,7 +33,18 @@ haro_state_t orchestrator_get_state(void)
 
 void orchestrator_on_wake_word(void)
 {
-    if (s_state != HARO_STATE_IDLE) return;
+    if (s_state == HARO_STATE_PLAYING_MUSIC) {
+        // Interrupting music: stop local playback immediately and tell the
+        // server to stop streaming more of the track, then fall through to
+        // the normal "start listening" transition below -- unlike every
+        // other non-IDLE state, this one doesn't just ignore a wake word.
+        s_ops.audio_out.stop(s_ops.audio_out.ctx);
+        if (s_ops.server.send_interrupt) {
+            s_ops.server.send_interrupt(s_ops.server.ctx);
+        }
+    } else if (s_state != HARO_STATE_IDLE) {
+        return;
+    }
     s_state = HARO_STATE_LISTENING;
     s_ops.face.show(s_ops.face.ctx, EXPR_LISTENING);
 }
@@ -75,7 +86,7 @@ static void return_to_idle(void)
 
 void orchestrator_on_server_event(orchestrator_server_event_t event)
 {
-    if (s_state != HARO_STATE_THINKING && s_state != HARO_STATE_SPEAKING) {
+    if (s_state != HARO_STATE_THINKING && s_state != HARO_STATE_SPEAKING && s_state != HARO_STATE_PLAYING_MUSIC) {
         if (event.type != ORCHESTRATOR_SERVER_EVENT_DISCONNECTED) return;
     }
 
@@ -89,15 +100,68 @@ void orchestrator_on_server_event(orchestrator_server_event_t event)
         } else if (event.protocol_event.type == PROTOCOL_EVENT_ERROR) {
             s_ops.face.show(s_ops.face.ctx, EXPR_ERROR);
             return_to_idle();
+        } else if (event.protocol_event.type == PROTOCOL_EVENT_ACTION) {
+            if (strcmp(event.protocol_event.action_name, "music_playing") == 0) {
+                // Long-running, wake-word-interruptible playback -- driven
+                // by main.c's own state-polling loop (a scrolling note
+                // animation), not the one-shot blocking show_action()
+                // reveal dice/coin use below. No face_display call here at
+                // all: main.c already polls orchestrator_get_state() every
+                // tick for the idle-fidget cycle, and does the same for
+                // this state.
+                s_state = HARO_STATE_PLAYING_MUSIC;
+            } else {
+                // No audio for these actions (session.py sends action +
+                // response_end back to back, no TTS) -- SPEAKING here just
+                // borrows the state that keeps the guard above accepting
+                // the response_end that follows immediately after, not
+                // because anything is playing.
+                s_state = HARO_STATE_SPEAKING;
+                if (s_ops.face.show_action) {
+                    s_ops.face.show_action(s_ops.face.ctx, event.protocol_event.action_name,
+                                            event.protocol_event.action_result);
+                }
+            }
         }
         break;
     case ORCHESTRATOR_SERVER_EVENT_AUDIO:
-        s_state = HARO_STATE_SPEAKING;
+        // Deliberately does NOT downgrade PLAYING_MUSIC back to SPEAKING:
+        // every subsequent chunk of the same track re-enters this case,
+        // and forcing SPEAKING here would silently lose the
+        // wake-word-interrupts-music behavior (orchestrator_on_wake_word()
+        // only special-cases PLAYING_MUSIC specifically) after the very
+        // first chunk.
+        if (s_state != HARO_STATE_PLAYING_MUSIC) {
+            s_state = HARO_STATE_SPEAKING;
+        }
         s_ops.audio_out.play_chunk(s_ops.audio_out.ctx, event.audio_data, event.audio_len);
         break;
     case ORCHESTRATOR_SERVER_EVENT_DISCONNECTED:
+        // Already idle: nothing to reset, so skip return_to_idle()'s
+        // audio_out.stop() call. That call used to be a harmless no-op
+        // (see audio_pipeline_stop_playback()'s comment for why it now
+        // genuinely closes/reopens the speaker codec, audibly) -- and a
+        // flaky WiFi link reconnecting repeatedly can fire this DISCONNECTED
+        // event many times in a row while nothing has changed in between
+        // (confirmed on real hardware: a "Reconnect after 1000 ms" cycle
+        // repeating for 30+ seconds, each attempt re-triggering this case).
+        // Without this guard, every one of those redundant events was an
+        // audible pop through the speaker for no reason -- a rapid,
+        // repeating "tatatata" instead of one clean stop.
+        if (s_state == HARO_STATE_IDLE) {
+            break;
+        }
         s_ops.face.show(s_ops.face.ctx, EXPR_ERROR);
         return_to_idle();
         break;
     }
+}
+
+void orchestrator_force_idle(void)
+{
+    if (s_state == HARO_STATE_IDLE) {
+        return;
+    }
+    s_ops.face.show(s_ops.face.ctx, EXPR_ERROR);
+    return_to_idle();
 }

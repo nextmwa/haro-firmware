@@ -42,11 +42,30 @@
 //     (movemodel.py, invoked from esp-sr's CMakeLists.txt when
 //     CONFIG_PARTITION_TABLE_CUSTOM is set) only packs models whose Kconfig
 //     symbol is enabled into the "model" SPIFFS partition. Without enabling
-//     one, `esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp")` would resolve
-//     to NULL at runtime even though the build succeeds. sdkconfig.defaults
-//     sets `CONFIG_SR_WN_WN9_HIESP=y` (the ESP32-S3 WakeNet9 "Hi,ESP" model --
-//     confirmed present at managed_components/espressif__esp-sr/model/wakenet_model/wn9_hiesp
-//     and listed in wakeword_list.md) to make this concrete.
+//     one, `esp_srmodel_filter(models, ESP_WN_PREFIX, "heykira")` would
+//     resolve to NULL at runtime even though the build succeeds.
+//     sdkconfig.defaults sets `CONFIG_SR_WN_WN9_HEYKIRA_TTS3=y` and
+//     `CONFIG_SR_WN_WN9_HIWALLE_TTS2=y` (confirmed present at
+//     managed_components/espressif__esp-sr/model/wakenet_model/wn9_heykira_tts3
+//     and .../wn9_hiwalle_tts2) to make this concrete.
+//
+//     Two wake words, not one: esp_afe_config_t has wakenet_model_name
+//     (wakenet 1) AND wakenet_model_name_2 (wakenet 2) -- see
+//     wake_word_start() below -- each ~290KB against the 5900KB "model"
+//     partition, so running both is not a size concern. They DO need to be
+//     mutually compatible, though: confirmed on real hardware that a first
+//     attempt pairing Jarvis with "Hey,GiGi" crash-looped on every single
+//     boot with `assert failed: model_detect_mfcc wakenet9_quantized.c:1008
+//     (cq->n == model->layers[0]->n)` -- a real dimension mismatch inside
+//     the WakeNet library itself, not a config mistake. Each model's
+//     `_MODEL_INFO_` file encodes its internal hidden-layer size in its
+//     name as "...h<N>..." -- Hey,Kira and Hi,Wall,E are both "h12"
+//     (Jarvis/Alexa, this pairing's predecessor, were both "h8"; Hey,GiGi
+//     is "h18" -- none of these three sizes are interchangeable with each
+//     other). Two WakeNet models sharing the same AFE feature pipeline
+//     need matching hidden-layer sizes; pick any new second wake word by
+//     checking its `_MODEL_INFO_` "h<N>" against the first one's before
+//     swapping either.
 //
 //  5. (Task 10) End-of-speech: `afe_fetch_result_t.vad_state` is already
 //     computed on every fetch() call because `afe_config->vad_init = true`
@@ -86,6 +105,7 @@
 #include "audio_pipeline.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "freertos/idf_additions.h"
 #include "esp_timer.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -179,6 +199,15 @@ static void feed_task(void *arg)
         esp_err_t err = audio_pipeline_read(raw, raw_bytes, &bytes_read);
         if (err != ESP_OK || bytes_read != raw_bytes) {
             ESP_LOGW(TAG, "feed_task: short/failed read (%s, %u bytes)", esp_err_to_name(err), (unsigned)bytes_read);
+            // vTaskDelay, not a bare continue: audio_pipeline_read()
+            // returns immediately (not blocking) on a codec/I2S error, so
+            // a PERSISTENT fault here spun this loop at 100% CPU with no
+            // yield -- on core 0 at priority 5, found by whole-codebase
+            // review to be enough to starve IDLE0 and trip the task
+            // watchdog. One tick is enough to let the scheduler breathe
+            // without adding meaningful latency to the (rare) real error
+            // case this guards.
+            vTaskDelay(1);
             continue;
         }
 
@@ -246,12 +275,35 @@ static void feed_task(void *arg)
 // really has finished.
 #define SPEECH_END_SILENCE_MS 700
 
+// Found on real hardware (still cutting users off after "Jarvis", even
+// with the 700ms threshold above): the wake phrase itself IS speech, so
+// AFE's vad_state is already VAD_SPEECH at the moment WAKENET_DETECTED
+// fires -- seen_speech (file header item 5) goes true from the tail of
+// the wake word's own audio, not from the user's actual command. The
+// natural pause everyone makes after saying a wake word (a habit trained
+// by assistants that beep first) is then enough on its own to cross
+// SPEECH_END_SILENCE_MS before the command has even started, ending
+// listening with little or nothing captured. Ignoring VAD entirely for a
+// short grace window right after detection -- not counting it toward
+// seen_speech OR toward a silence run -- gives that pause somewhere to
+// go: only speech/silence transitions from the actual command, observed
+// after the grace window, can now trigger end-of-speech. 500ms covers
+// the reported case without making the device feel sluggish; the
+// mid-silence-wakeup protection from item 5 (a wake word firing after
+// vad_state has already decayed to VAD_SILENCE) still applies once the
+// grace window elapses.
+#define WAKE_WORD_GRACE_MS 500
+
 static void detect_task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
     // Set once a wake word fires, cleared once WAKE_WORD_SPEECH_END is
     // posted for it -- gates end-of-speech tracking to "listening" periods.
     bool awaiting_speech_end = false;
+    // Timestamp of the most recent WAKENET_DETECTED -- see
+    // WAKE_WORD_GRACE_MS's comment. Only meaningful while
+    // awaiting_speech_end is true.
+    int64_t wake_detected_us = 0;
     // Set the first time vad_state == VAD_SPEECH is observed while
     // awaiting_speech_end is true; only after this do we treat VAD_SILENCE
     // as (possibly) the end of speech (see file header comment item 5).
@@ -267,6 +319,11 @@ static void detect_task(void *arg)
         afe_fetch_result_t *res = s_afe_handle->fetch(afe_data);
         if (res == NULL || res->ret_value == ESP_FAIL) {
             ESP_LOGE(TAG, "AFE fetch error");
+            // Same reasoning as feed_task's read-error path above: fetch()
+            // normally blocks, so this is the lesser risk of the two, but
+            // a persistent AFE fault returning immediately every call
+            // would still spin core 1 at 100% with no yield.
+            vTaskDelay(1);
             continue;
         }
         if (res->wakeup_state == WAKENET_DETECTED) {
@@ -278,9 +335,15 @@ static void detect_task(void *arg)
             awaiting_speech_end = true;
             seen_speech = false;
             in_silence = false;
+            wake_detected_us = esp_timer_get_time();
         }
 
-        if (awaiting_speech_end) {
+        if (awaiting_speech_end && (esp_timer_get_time() - wake_detected_us) < (int64_t)WAKE_WORD_GRACE_MS * 1000) {
+            // Still inside the post-wake-word grace window -- ignore
+            // vad_state entirely (see WAKE_WORD_GRACE_MS's comment): the
+            // wake phrase's own trailing audio must not arm seen_speech,
+            // and a pause here must not start a silence run either.
+        } else if (awaiting_speech_end) {
             if (res->vad_state == VAD_SPEECH) {
                 seen_speech = true;
                 in_silence = false;
@@ -318,16 +381,23 @@ esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_q
         return ESP_FAIL;
     }
 
-    char *wakenet_model_name = esp_srmodel_filter(s_models, ESP_WN_PREFIX, "hiesp");
+    char *wakenet_model_name = esp_srmodel_filter(s_models, ESP_WN_PREFIX, "heykira");
     if (wakenet_model_name == NULL) {
-        ESP_LOGE(TAG, "\"hiesp\" WakeNet model not found -- check CONFIG_SR_WN_WN9_HIESP in sdkconfig");
+        ESP_LOGE(TAG, "\"heykira\" WakeNet model not found -- check CONFIG_SR_WN_WN9_HEYKIRA_TTS3 in sdkconfig");
         esp_srmodel_deinit(s_models);
         s_models = NULL;
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "using WakeNet model: %s", wakenet_model_name);
+    char *wakenet_model_name_2 = esp_srmodel_filter(s_models, ESP_WN_PREFIX, "hiwalle");
+    if (wakenet_model_name_2 == NULL) {
+        ESP_LOGE(TAG, "\"hiwalle\" WakeNet model not found -- check CONFIG_SR_WN_WN9_HIWALLE_TTS2 in sdkconfig");
+        esp_srmodel_deinit(s_models);
+        s_models = NULL;
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "using WakeNet models: %s, %s", wakenet_model_name, wakenet_model_name_2);
 
-    // TEMPORARY "M" (mono, single-channel, no BSS) instead of "MM" (2-mic
+    // "M" (mono, single-channel, no BSS) instead of "MM" (2-mic
     // BSS/beamforming) -- see feed_task's file header comment for why.
     afe_config_t *afe_config = afe_config_init("M", s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (afe_config == NULL) {
@@ -338,7 +408,24 @@ esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_q
     }
     afe_config->wakenet_init = true;
     afe_config->wakenet_model_name = wakenet_model_name;
+    afe_config->wakenet_model_name_2 = wakenet_model_name_2;
     afe_config->vad_init = true;
+    // Found on real hardware: background noise or other people talking in
+    // the room kept vad_state at VAD_SPEECH indefinitely, so
+    // WAKE_WORD_SPEECH_END (below, requiring sustained VAD_SILENCE) never
+    // fired -- the robot listened until the caller gave up. Verified
+    // against Espressif's own esp-skainet voice_activity_detection example
+    // (espressif/esp-skainet, examples/voice_activity_detection/main/main.c)
+    // before changing this: its comment on vad_mode is explicit -- "The
+    // larger the mode, the higher the speech trigger probability" -- so
+    // VAD_MODE_0 (not a larger value) is the conservative, fewer-false-
+    // positives end of the scale. vad_min_noise_ms/vad_min_speech_ms are
+    // set to that same example's values (documented AFE defaults, pinned
+    // explicitly here so a future esp-sr default change can't silently
+    // shift this behavior).
+    afe_config->vad_mode = VAD_MODE_0;
+    afe_config->vad_min_noise_ms = 1000;
+    afe_config->vad_min_speech_ms = 128;
     afe_config = afe_config_check(afe_config);
 
     s_afe_handle = esp_afe_handle_from_config(afe_config);
@@ -350,7 +437,39 @@ esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_q
         return ESP_FAIL;
     }
 
-    xTaskCreatePinnedToCore(detect_task, "wake_word_detect", 8192, afe_data, 5, NULL, 1);
-    xTaskCreatePinnedToCore(feed_task, "wake_word_feed", 8192, afe_data, 5, NULL, 0);
+    // detect_task's stack moves to PSRAM (WithCaps, same fix as
+    // orchestrator_task's -- see main.c) -- found by whole-codebase review
+    // that NEITHER task creation here checked its result, on a board
+    // already found to run internal SRAM down to ~2KB free at times.
+    // detect_task holds only AFE-handle-derived state, no DMA/ISR-only
+    // buffers, so it has no reason to need internal-only memory. Its
+    // return value is now checked and propagated: a silent allocation
+    // failure here previously meant a device that boots fine and never
+    // responds to the wake word at all, with no log line anywhere.
+    // feed_task was initially left on internal RAM out of caution (it's
+    // the hot path reading from the I2S/esp_codec_dev driver every cycle,
+    // and that path wasn't verified safe against PSRAM-backed call
+    // stacks) -- reverted after checking this call's result exposed a
+    // REAL failure on real hardware: even after moving detect_task, this
+    // file's caller, and status_led_breathe off internal RAM (freeing
+    // ~14.5KB combined), feed_task's own 8KB internal-RAM allocation still
+    // failed outright (ESP_ERR_NO_MEM), crash-looping the device via
+    // main.c's ESP_ERROR_CHECK(wake_word_start(...)). Internal RAM is
+    // tighter than that freed-up amount could fix. Moved to PSRAM too;
+    // verify on real hardware afterward that wake-word detection and
+    // audio capture are still solid (this is the one migration the
+    // review flagged as unverified, not confirmed safe).
+    BaseType_t detect_created = xTaskCreatePinnedToCoreWithCaps(detect_task, "wake_word_detect", 8192, afe_data, 5,
+                                                                 NULL, 1, MALLOC_CAP_SPIRAM);
+    if (detect_created != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreatePinnedToCoreWithCaps(wake_word_detect) failed: %d", (int)detect_created);
+        return ESP_ERR_NO_MEM;
+    }
+    BaseType_t feed_created = xTaskCreatePinnedToCoreWithCaps(feed_task, "wake_word_feed", 8192, afe_data, 5, NULL, 0,
+                                                               MALLOC_CAP_SPIRAM);
+    if (feed_created != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreatePinnedToCoreWithCaps(wake_word_feed) failed: %d", (int)feed_created);
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }

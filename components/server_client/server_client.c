@@ -47,6 +47,98 @@ static const char *TAG = "server_client";
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_event_queue;
 
+// Bounded, not portMAX_DELAY, on the three orchestrator_task-bound sends
+// below (audio frame, end-of-speech, interrupt): confirmed on real
+// hardware that a degraded WiFi link (weak signal, congested channel) can
+// make esp_websocket_client block on a send far longer than any caller
+// should ever wait -- and since orchestrator_task's whole loop (mic
+// forwarding, server event draining, display/servo updates, ...) is one
+// single-threaded while(true), a portMAX_DELAY block on any one of these
+// doesn't just delay that one message, it freezes the entire device until
+// the network recovers (observed: 30+ seconds with zero recovery, both
+// server_client.c's own event queue and wake_word's audio frame queue
+// overflowing the whole time because nothing was draining either -- the
+// device needed a physical reset to come back).
+//
+// NOT "one dropped/failed message during a rough network patch", though,
+// contrary to what an earlier version of this comment claimed: a timed-out
+// send here aborts the WHOLE connection (see HELLO_SEND_TIMEOUT's comment
+// below for the exact mechanism), so too tight a bound trades the
+// device-freeze risk for "drops mid-conversation on any network slower than
+// this value". 200ms (the original value) was too tight for a real
+// corporate network encountered in use -- raised to 1000ms as a middle
+// ground: still bounded (this file's three orchestrator_task sends can't
+// use HELLO_SEND_TIMEOUT's unbounded wait, since THEY can lock
+// up the device), but 5x more slack against the same kind of latency that
+// made hello/camera-frame sends fail below. main.c's audio-frame drain
+// loop also now caps how many sends it can stack in one iteration
+// (AUDIO_FRAME_DRAIN_BUDGET_MS), so a run of slow sends here can no longer
+// compound into a multi-second single-iteration stall the way it could
+// when this bound was raised without that change too.
+#define SEND_TIMEOUT_MS 1000
+
+// send_hello() and server_client_send_camera_frame() below are the two
+// exceptions to SEND_TIMEOUT_MS -- but NOT the same bound as each other
+// (see CAMERA_FRAME_SEND_TIMEOUT_MS below for why they diverged after
+// starting out identical). Found on real hardware (a corporate WiFi
+// network with more latency than the network SEND_TIMEOUT_MS was tuned
+// against): a failed send here isn't a harmless skip of that one message
+// -- esp_websocket_client_send_with_exact_opcode() calls
+// esp_websocket_client_abort_connection() on ANY write that doesn't
+// complete in time ("Calling abort_connection due to send error", in
+// esp_websocket_client.c), tearing down the WHOLE connection over a single
+// slow write. camera_face_track.c's own comment on its send call ("a
+// camera frame that can't go out in 200ms is simply skipped") was wrong
+// about this for exactly that reason -- a base64-encoded JPEG (several KB,
+// far bigger than any other message this file sends) plus a fresh TCP
+// connection still in slow-start is routinely slower than 200ms on this
+// network, and every one of those "skips" was actually killing the
+// connection and forcing a reconnect, repeating forever. Neither call
+// site runs on orchestrator_task's loop (send_hello() runs from
+// esp_websocket_client's own internal task via WEBSOCKET_EVENT_CONNECTED;
+// server_client_send_camera_frame() runs from camera_face_track.c's own
+// face_track_task) -- so the lockup risk that justifies SEND_TIMEOUT_MS's
+// 200ms bound on orchestrator_task's own sends (audio frames, end-of-
+// speech, interrupt) does not apply to either of these.
+//
+// Even 5000ms here wasn't enough on real hardware (a corporate network):
+// confirmed on real hardware by raising this to 5000ms and watching the
+// SAME "WebSocket connected" -> abort cycle recur, just ~5s later instead
+// of ~200ms, so this was raised again, to unbounded (portMAX_DELAY) --
+// restoring the behavior these two sends had before SEND_TIMEOUT_MS
+// existed (an earlier, separate fix, for the three orchestrator_task-
+// bound sends below, where an unbounded wait really did freeze the whole
+// device for 30+ seconds). This is send_hello()'s final value: it runs
+// once per connection and is tiny (one short JSON message), so there's no
+// real downside to letting it wait as long as the network needs.
+#define HELLO_SEND_TIMEOUT portMAX_DELAY
+
+// server_client_send_camera_frame() started out sharing
+// HELLO_SEND_TIMEOUT's unbounded wait too -- reverted after that choice
+// caused a DIFFERENT real disconnect, root-caused by reading uvicorn's
+// actual Config defaults (ws_ping_interval=20.0, ws_ping_timeout=20.0,
+// neither overridden anywhere in haro-server) against this library's own
+// source: unlike hello, this send repeats every camera_face_track.c poll
+// cycle (FACE_TRACK_POLL_MS), so an unbounded wait here can hold
+// client->tx_lock (CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y, see
+// sdkconfig.defaults' comment on that option) for long enough that the
+// SAME lock's PING/PONG handling ("Could not lock ws-client within 2000
+// timeout for PONG", confirmed on real hardware) can't run either -- the
+// server never gets a PONG back, and closes the "unresponsive" connection
+// at its own fixed 20+20=40s mark regardless of anything this file's own
+// SEND_TIMEOUT_MS-family constants control. A camera-frame write that's
+// still ongoing is not actually a problem (server_client_send_camera_
+// frame() is expected to sometimes fail on this network, per its own
+// comment on FACE_TRACK_POLL_MS's cadence below) -- what matters is that
+// the write releases the lock again well inside the 20s ping window
+// instead of monopolizing it, bounded so it can't stack up worse than a
+// single frame at a time. 8000ms: long enough to succeed more often than
+// the 5000ms that was tried and found insufficient before going
+// unbounded, short enough to leave real room in a 20s ping cycle for
+// PING/PONG traffic to get a turn even if one camera-frame write uses the
+// whole budget.
+#define CAMERA_FRAME_SEND_TIMEOUT_MS 8000
+
 // Found on real hardware: TTS playback came out garbled/stuttering.
 // esp_websocket_client's receive buffer defaults to 1024 bytes
 // (WEBSOCKET_BUFFER_SIZE_BYTE in esp_websocket_client.c, not overridden by
@@ -92,7 +184,7 @@ static esp_err_t send_hello(void)
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), portMAX_DELAY);
+    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), HELLO_SEND_TIMEOUT);
     free(json);
     return sent >= 0 ? ESP_OK : ESP_FAIL;
 }
@@ -172,6 +264,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "failed to send hello: %s", esp_err_to_name(err));
         }
+        server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_CONNECTED };
+        if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "event queue full, dropping connected event");
+        }
         break;
     }
     case WEBSOCKET_EVENT_DISCONNECTED: {
@@ -199,6 +295,17 @@ esp_err_t server_client_init(const char *url, const char *session_id, QueueHandl
 
     esp_websocket_client_config_t config = {
         .uri = url,
+        // Total retry cycle = network_timeout_ms (how long one connect
+        // attempt waits before giving up) + reconnect_timeout_ms (pause
+        // before the next attempt) -- leaving network_timeout_ms unset
+        // defaults to 10000ms on its own, so reconnect_timeout_ms=1000
+        // alone gives an ~11s cycle, not the requested "one attempt every
+        // 10s". (Briefly suspected this setting of causing the connect-
+        // then-immediately-drop bug below -- ruled out by reverting it on
+        // real hardware and seeing the exact same failure; the real cause
+        // was HELLO_SEND_TIMEOUT's/CAMERA_FRAME_SEND_TIMEOUT_MS's,
+        // unrelated to this config.)
+        .network_timeout_ms = 9000,
         .reconnect_timeout_ms = 1000,
     };
     s_client = esp_websocket_client_init(&config);
@@ -218,7 +325,7 @@ esp_err_t server_client_init(const char *url, const char *session_id, QueueHandl
 
 esp_err_t server_client_send_audio_frame(const uint8_t *data, size_t len)
 {
-    int sent = esp_websocket_client_send_bin(s_client, (const char *)data, (int)len, portMAX_DELAY);
+    int sent = esp_websocket_client_send_bin(s_client, (const char *)data, (int)len, pdMS_TO_TICKS(SEND_TIMEOUT_MS));
     return sent >= 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -228,7 +335,41 @@ esp_err_t server_client_send_end_of_speech(void)
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), portMAX_DELAY);
+    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), pdMS_TO_TICKS(SEND_TIMEOUT_MS));
+    free(json);
+    return sent >= 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t server_client_send_interrupt(void)
+{
+    char *json = protocol_encode_interrupt();
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), pdMS_TO_TICKS(SEND_TIMEOUT_MS));
+    free(json);
+    return sent >= 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t server_client_send_camera_frame(const uint8_t *jpeg, size_t jpeg_len)
+{
+    char *json = protocol_encode_camera_frame(jpeg, jpeg_len);
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    // esp_websocket_client_send_text() fragments large payloads into
+    // multiple WebSocket frames internally -- a base64-encoded JPEG
+    // (several KB, far bigger than any other message this file sends)
+    // needs a longer, non-orchestrator-task bound than SEND_TIMEOUT_MS,
+    // same as send_hello() -- but NOT the same unbounded wait: see
+    // CAMERA_FRAME_SEND_TIMEOUT_MS's comment for why going unbounded here
+    // specifically caused a different real disconnect (this send repeats
+    // every poll cycle, unlike hello's once-per-connection). Bounded, this
+    // call is still expected to sometimes fail outright on a slow network
+    // -- camera_face_track.c sends a fresh frame every FACE_TRACK_POLL_MS
+    // anyway, so losing one is a non-issue, same as always. That file's
+    // own face_track_task calls this, not orchestrator_task.
+    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), pdMS_TO_TICKS(CAMERA_FRAME_SEND_TIMEOUT_MS));
     free(json);
     return sent >= 0 ? ESP_OK : ESP_FAIL;
 }

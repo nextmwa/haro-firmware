@@ -4,6 +4,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include <math.h>
 
 // GPIO38 = silkscreen "RGB_LED", 7x WS2812B-0807 chained on a single data
@@ -93,7 +95,13 @@ esp_err_t status_led_init(void)
         .strip_gpio_num = STATUS_LED_GPIO,
         .max_leds = STATUS_LED_COUNT,
         .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB, // WS2812's native wire order
+        // Found on real hardware: with the "standard" GRB wire order below,
+        // requesting pure red (255,0,0) rendered as green on this board's
+        // specific LEDs -- i.e. this chain actually expects RGB order, not
+        // every WS2812(-labelled) chip agrees on wire order, and clones in
+        // particular vary. RGB confirmed correct against the same
+        // real-hardware red-vs-green test.
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB,
         .flags = { .invert_out = false },
     };
     led_strip_rmt_config_t rmt_config = {
@@ -120,7 +128,22 @@ esp_err_t status_led_init(void)
         ESP_LOGW(TAG, "led_strip_clear failed: %s", esp_err_to_name(err));
     }
 
-    xTaskCreate(breathing_task, "status_led_breathe", 2560, NULL, 3, NULL);
+    // WithCaps (PSRAM stack), checked -- same fix, same reasoning, as
+    // orchestrator_task's in main.c: found by whole-codebase review that
+    // this xTaskCreate() call was never checked, on a board already found
+    // to run internal SRAM down to ~2KB free at times. breathing_task's
+    // own state is a handful of floats/doubles (sin/pow) plus the mutex
+    // above -- nothing here needs internal-only memory.
+    BaseType_t task_created = xTaskCreateWithCaps(breathing_task, "status_led_breathe", 2560, NULL, 3, NULL,
+                                                   MALLOC_CAP_SPIRAM);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreateWithCaps(status_led_breathe) failed: %d", (int)task_created);
+        vSemaphoreDelete(s_mutex);
+        s_mutex = NULL;
+        led_strip_del(s_strip);
+        s_strip = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     ESP_LOGI(TAG, "status_led initialized (%d LEDs on GPIO%d)", STATUS_LED_COUNT, STATUS_LED_GPIO);
     return ESP_OK;
 }

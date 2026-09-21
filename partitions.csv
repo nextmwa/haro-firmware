@@ -1,9 +1,9 @@
 # Name,     Type, SubType, Offset,   Size, Flags
 nvs,        data,   nvs,      0x9000,       0x6000,
-# Was bumped to 5M when the (since-removed) camera_face_track component --
-# esp32-camera + esp-dl's bundled face-detect model weights -- pushed the
-# built binary to ~3.62MB. With that component gone the binary is back to
-# ~2.6MB; 3M restores the original headroom without carrying flash reserved
-# for a dependency that's no longer built.
-factory,    app,    factory,  0x10000,      3M,
+# camera_face_track (esp32-camera + esp-dl's bundled face-detect model
+# weights) pushes the built binary to ~3.63MB -- confirmed via "app
+# partition is too small for binary" at build time with the 3M size below.
+# 5M leaves comfortable room to grow; still ~5MB free in the board's 16MB
+# flash after `model` below (CONFIG_ESPTOOLPY_FLASHSIZE_16MB).
+factory,    app,    factory,  0x10000,      5M,
 model,      data,   spiffs,   ,             5900K,

@@ -61,6 +61,70 @@ esp_err_t face_display_set_gaze_offset(int dx_px, int dy_px);
 // as face_display_set_gaze_offset().
 esp_err_t face_display_set_blink(float openness);
 
+// Renders a deterministic action result (matches orchestrator_face_ops_t's
+// show_action contract): `name` is "dice_roll" (result a decimal digit
+// string "1".."6") or "coin_flip" (result "testa" or "croce"). Plays a
+// short rolling/flipping flourish, settles on the result, holds it, then
+// returns -- this call BLOCKS the calling task for its whole duration
+// (~8s total: 3s roll + 5s hold, see face_display.c's ACTION_* constants),
+// same trade-off
+// as face_display_show()'s existing blocking animation. Unlike
+// face_display_show()/the gaze-offset overlay, does not touch
+// s_current_pose: the next real face_display_show() call cross-fades from
+// whatever expression was showing BEFORE this action, not from the
+// die/coin graphic, so the transition off this screen is an abrupt cut.
+// Returns ESP_ERR_INVALID_STATE if no display is attached,
+// ESP_ERR_INVALID_ARG if `name` isn't recognized.
+esp_err_t face_display_show_action(const char *name, const char *result);
+
+// Draws a row of musical notes scrolling right-to-left, replacing the eyes
+// entirely -- for HARO_STATE_PLAYING_MUSIC. Unlike face_display_show_action()
+// above, this does NOT block: call it repeatedly (e.g. every ~100ms) from
+// main.c's own polling loop with an increasing `scroll_offset` (any
+// monotonically increasing/decreasing int; only its value mod ~42 matters)
+// to animate the scroll -- one call is one static frame. Same "does not
+// touch s_current_pose" contract as the other overlays: the next real
+// face_display_show() cuts back to the last real expression, not a
+// cross-fade from this. Returns ESP_ERR_INVALID_STATE if no display is
+// attached.
+esp_err_t face_display_set_music_notes(int scroll_offset);
+
+// Draws `text` scrolling right-to-left along a single horizontal line,
+// replacing the eyes entirely -- a generic primitive used for both the
+// server-unreachable diagnostic screen (main.c) and the boot-time
+// wake-word reminder (main.c's app_main(), before orchestrator_task
+// starts). Same non-blocking, call-repeatedly-with-an-increasing-
+// scroll_offset contract as face_display_set_music_notes() above (one
+// call is one static frame), and the same "does not touch s_current_pose"
+// overlay contract as the rest of this file's one-off screens: the next
+// real face_display_show() cuts back to the last real expression, not a
+// cross-fade from this. Uses font5x7 (5x7 px per glyph, 1px gap) -- only
+// the characters font5x7_glyph() actually supports render meaningfully;
+// anything else renders blank. Returns ESP_ERR_INVALID_STATE if no
+// display is attached.
+esp_err_t face_display_set_scrolling_text(const char *text, int scroll_offset);
+
+// Boot-time WiFi status, called from wifi_provisioning.c. Same "replaces
+// the eyes entirely, one-off, doesn't touch s_current_pose" contract as
+// face_display_show_action() -- not a mood, so not part of
+// face_display_show()'s cross-fading expression system. Draws a
+// conventional wifi-signal glyph (arcs over a dot) and returns
+// immediately -- call this right before starting a scan/connect attempt;
+// it stays on screen for as long as that attempt itself takes, no separate
+// hold needed. Returns ESP_ERR_INVALID_STATE if no display is attached.
+esp_err_t face_display_show_wifi_searching(void);
+
+// Draws a thumbs-up and holds it ~1.5s before returning (see
+// face_display.c's WIFI_CONNECTED_HOLD_MS) -- call this once a
+// scan-matched or newly-provisioned network actually connects. Same
+// ESP_ERR_INVALID_STATE condition as face_display_show_wifi_searching().
+// There's no third "entered AP/provisioning mode" function here: call
+// face_display_show(EXPR_SETUP) for that instead -- it's a genuinely
+// indefinite wait (until someone provisions a new network via the app),
+// which fits the normal interruptible mood system better than a one-shot
+// graphic.
+esp_err_t face_display_show_wifi_connected(void);
+
 #ifdef __cplusplus
 }
 #endif

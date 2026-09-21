@@ -4,10 +4,13 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_ssd1306.h"
 #include "esp_lcd_panel_vendor.h"
+#include "font5x7.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_random.h"
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 #include <stdbool.h>
 
@@ -52,6 +55,18 @@ static inline void set_pixel(uint8_t *fb, int x, int y)
         return;
     }
     fb[(y / 8) * WIDTH + x] |= (uint8_t)(1u << (y % 8));
+}
+
+// Every existing shape in this file is additive (set_pixel only) since
+// every expression is drawn on a freshly-cleared framebuffer. The die face
+// (face_display_show_action() below) is the first shape that needs to
+// punch dark pips out of an already-lit white square, hence this pair.
+static inline void clear_pixel(uint8_t *fb, int x, int y)
+{
+    if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) {
+        return;
+    }
+    fb[(y / 8) * WIDTH + x] &= (uint8_t) ~(1u << (y % 8));
 }
 
 // --- Drawing primitives, ported from haro/src/haro/face_display.py -------
@@ -185,6 +200,19 @@ static void draw_filled_circle(uint8_t *fb, int cx, int cy, int r)
         for (int x = -r; x <= r; x++) {
             if (x * x + y * y <= r * r) {
                 set_pixel(fb, cx + x, cy + y);
+            }
+        }
+    }
+}
+
+// Same shape as draw_filled_circle(), but punches it out (dark) instead of
+// lighting it -- see clear_pixel()'s comment. Used for die pips.
+static void clear_filled_circle(uint8_t *fb, int cx, int cy, int r)
+{
+    for (int y = -r; y <= r; y++) {
+        for (int x = -r; x <= r; x++) {
+            if (x * x + y * y <= r * r) {
+                clear_pixel(fb, cx + x, cy + y);
             }
         }
     }
@@ -604,4 +632,277 @@ esp_err_t face_display_set_blink(float openness)
 {
     s_overlay_blink = openness;
     return render_overlay();
+}
+
+// --- Action results (dice roll, coin flip, ...) -----------------------
+//
+// Deliberately NOT part of the eye_pose_t/face_pose_t system above: a die
+// or coin isn't an eye shape, and these are one-off reveals (server sends
+// response_end right after, which returns to idle) rather than a mood that
+// needs cross-fading. That does mean the transition FROM this screen back
+// to idle eyes is a hard cut, not a smooth cross-fade like every other
+// expression change -- acceptable for a one-off graphic, not worth
+// extending the pose-interpolation system for.
+
+// Standard 1-6 die pip layout, drawn as dark circles punched out of a
+// solid white rounded square (see clear_filled_circle()'s comment on why a
+// die needs "subtractive" drawing, unlike every other shape in this file).
+static void draw_die_face(uint8_t *fb, int value)
+{
+    memset(fb, 0, WIDTH * HEIGHT / 8);
+    int cx = WIDTH / 2, cy = HEIGHT / 2;
+    int size = 44;
+    draw_rounded_rect(fb, cx, cy, size, size, 8);
+    int pip_r = 4;
+    int off = size / 4;
+    bool center = (value == 1 || value == 3 || value == 5);
+    bool corners = (value >= 2);
+    bool middles = (value == 4 || value == 5 || value == 6);
+    if (center) {
+        clear_filled_circle(fb, cx, cy, pip_r);
+    }
+    if (corners) {
+        clear_filled_circle(fb, cx - off, cy - off, pip_r);
+        clear_filled_circle(fb, cx + off, cy + off, pip_r);
+    }
+    if (value >= 4) {
+        clear_filled_circle(fb, cx - off, cy + off, pip_r);
+        clear_filled_circle(fb, cx + off, cy - off, pip_r);
+    }
+    if (middles && value == 6) {
+        clear_filled_circle(fb, cx - off, cy, pip_r);
+        clear_filled_circle(fb, cx + off, cy, pip_r);
+    }
+}
+
+// "testa" (heads): a plain filled circle. "croce" (tails -- literally
+// "cross" in Italian, which is also the coin-flip term for that side): the
+// same X shape already used for the ERROR expression's eyes, just scaled
+// up. No text/font rendering needed for either.
+static void draw_coin_face(uint8_t *fb, bool testa)
+{
+    memset(fb, 0, WIDTH * HEIGHT / 8);
+    int cx = WIDTH / 2, cy = HEIGHT / 2;
+    if (testa) {
+        draw_filled_circle(fb, cx, cy, 22);
+    } else {
+        draw_eye_x(fb, cx, cy, 20, 6);
+    }
+}
+
+#define ACTION_ROLL_STEPS 30      // "rolling"/"flipping" flourish frames before settling -- 30 * 100ms = 3s
+#define ACTION_ROLL_STEP_MS 100
+#define ACTION_RESULT_HOLD_MS 5000 // how long the settled result stays on screen
+
+esp_err_t face_display_show_action(const char *name, const char *result)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool is_dice = (strcmp(name, "dice_roll") == 0);
+    bool is_coin = (strcmp(name, "coin_flip") == 0);
+    if (!is_dice && !is_coin) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < ACTION_ROLL_STEPS; i++) {
+        if (is_dice) {
+            draw_die_face(s_framebuffer, 1 + (int)(esp_random() % 6));
+        } else {
+            draw_coin_face(s_framebuffer, (i % 2) == 0);
+        }
+        esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+        vTaskDelay(pdMS_TO_TICKS(ACTION_ROLL_STEP_MS));
+    }
+
+    if (is_dice) {
+        int value = atoi(result);
+        if (value < 1 || value > 6) {
+            value = 1;
+        }
+        draw_die_face(s_framebuffer, value);
+    } else {
+        draw_coin_face(s_framebuffer, strcmp(result, "testa") == 0);
+    }
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+    vTaskDelay(pdMS_TO_TICKS(ACTION_RESULT_HOLD_MS));
+    return err;
+}
+
+// --- Music playback (scrolling notes) -----------------------------------
+//
+// Non-blocking, unlike face_display_show_action() above: a track can play
+// for minutes, so this can't hold the calling task hostage the way a
+// dice/coin reveal briefly can. main.c's orchestrator_task instead calls
+// this periodically (same "small periodic update from the normal loop
+// tick" pattern as its blink/saccade overlays) for as long as
+// HARO_STATE_PLAYING_MUSIC lasts, advancing scroll_offset a little each
+// time -- see main.c's music-notes block.
+
+// A simple stylized eighth note: a filled circle (notehead) + a stem +  a
+// short diagonal flag. No font/text rendering needed (matches this file's
+// existing no-font-since-the-mouth-was-removed stance).
+static void draw_note(uint8_t *fb, int cx, int cy)
+{
+    draw_filled_circle(fb, cx, cy + 8, 5);
+    draw_thick_line(fb, cx + 5, cy + 8, cx + 5, cy - 12, 2);
+    draw_thick_line(fb, cx + 5, cy - 12, cx + 12, cy - 6, 2);
+}
+
+esp_err_t face_display_set_music_notes(int scroll_offset)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memset(s_framebuffer, 0, WIDTH * HEIGHT / 8);
+    int cy = HEIGHT / 2;
+    const int spacing = 42;
+    // Notes are spaced `spacing` px apart, shifted left by scroll_offset
+    // (mod spacing so it wraps smoothly forever rather than overflowing),
+    // starting one full spacing past the right edge and stepping down past
+    // the left edge -- covers the whole width with no visible pop-in/out
+    // at the wrap point.
+    int shift = ((scroll_offset % spacing) + spacing) % spacing;
+    for (int x = WIDTH + spacing - shift; x > -spacing; x -= spacing) {
+        draw_note(s_framebuffer, x, cy);
+    }
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}
+
+// --- Scrolling text (server-unreachable diagnostic; boot-time wake-word
+// --- reminder) -----------------------------------------------------------
+//
+// The only text ever drawn on this display -- see the pose-model comment
+// above for why every mood/expression is font-free by design. This is a
+// deliberate, scoped exception for a couple of diagnostic/informational
+// screens, not a reintroduction of the old mouth/font system: font5x7 is a
+// minimal 5x7 glyph set covering only what those specific screens' text
+// needs (see font5x7.h), not general text rendering.
+
+#define SCROLLING_TEXT_GLYPH_GAP_PX 1
+// Blank gap between one loop of the scrolling string and the next repeat,
+// so the marquee doesn't read as the string running directly into itself.
+#define SCROLLING_TEXT_LOOP_GAP_PX 20
+
+static void draw_text(uint8_t *fb, const char *text, int x, int y)
+{
+    int cursor_x = x;
+    for (const char *p = text; *p != '\0'; p++) {
+        const uint8_t *glyph = font5x7_glyph(*p);
+        for (int col = 0; col < FONT5X7_WIDTH; col++) {
+            uint8_t bits = glyph[col];
+            for (int row = 0; row < FONT5X7_HEIGHT; row++) {
+                if (bits & (1u << row)) {
+                    set_pixel(fb, cursor_x + col, y + row);
+                }
+            }
+        }
+        cursor_x += FONT5X7_WIDTH + SCROLLING_TEXT_GLYPH_GAP_PX;
+    }
+}
+
+esp_err_t face_display_set_scrolling_text(const char *text, int scroll_offset)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memset(s_framebuffer, 0, WIDTH * HEIGHT / 8);
+    int len = (int)strlen(text);
+    int string_width = len * (FONT5X7_WIDTH + SCROLLING_TEXT_GLYPH_GAP_PX);
+    int period = string_width + SCROLLING_TEXT_LOOP_GAP_PX;
+    int y = (HEIGHT - FONT5X7_HEIGHT) / 2;
+
+    // Same wrap-forever approach as face_display_set_music_notes() above:
+    // shift left by scroll_offset (mod period), drawing repeated copies of
+    // the whole string spaced `period` px apart -- starting one full
+    // period past the right edge and stepping left past the left edge
+    // covers the whole width with no visible pop-in/out at the wrap point.
+    int shift = ((scroll_offset % period) + period) % period;
+    for (int x = WIDTH + period - shift; x > -string_width; x -= period) {
+        draw_text(s_framebuffer, text, x, y);
+    }
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}
+
+// --- WiFi connection status (boot-time, wifi_provisioning.c) -----------
+//
+// Two brief, discrete moments in the startup WiFi sequence -- same
+// "replaces the eyes entirely, one-off, doesn't touch s_current_pose"
+// contract as the action results above, not the eye_pose_t/face_pose_t
+// mood system (this isn't a mood, it's boot-time status). The third
+// moment, "entered AP/provisioning mode" (SoftAP up, waiting for someone
+// to submit new credentials via the app), deliberately does NOT get a
+// third icon here -- it reuses the existing EXPR_SETUP expression via the
+// normal face_display_show(EXPR_SETUP) instead. That wait is genuinely
+// indefinite (until a human acts), which fits the interruptible,
+// cross-fading mood system better than a one-shot graphic, and EXPR_SETUP
+// (small circle eyes) already existed for exactly this moment.
+
+// A conventional "wifi signal" glyph -- three concentric arcs bulging
+// upward over a dot, all centered on the dot -- the same real-world symbol
+// every phone status bar uses, so it reads correctly at this display's low
+// resolution without needing to be a literal photo of a router.
+static void draw_wifi_icon(uint8_t *fb)
+{
+    memset(fb, 0, WIDTH * HEIGHT / 8);
+    int cx = WIDTH / 2, hub_y = 46;
+    draw_filled_circle(fb, cx, hub_y, 4);
+
+    // Angle sweep centered on 90 degrees (straight up in this file's screen
+    // convention: y = hub_y - r*sin(theta), same rotation sense draw_eye()
+    // uses elsewhere) so each arc bulges upward with both ends curving down
+    // toward the dot -- 20..160 puts the ends at a shallow, natural-looking
+    // angle rather than reaching all the way down to the dot's own height.
+    const double start_deg = 20.0, end_deg = 160.0;
+    const int radii[3] = { 12, 20, 28 };
+    const int steps = 16;
+    for (int a = 0; a < 3; a++) {
+        for (int i = 0; i < steps; i++) {
+            double t0 = (start_deg + (end_deg - start_deg) * i / steps) * M_PI / 180.0;
+            double t1 = (start_deg + (end_deg - start_deg) * (i + 1) / steps) * M_PI / 180.0;
+            draw_thick_line(fb, cx + radii[a] * cos(t0), hub_y - radii[a] * sin(t0),
+                             cx + radii[a] * cos(t1), hub_y - radii[a] * sin(t1), 3);
+        }
+    }
+}
+
+// A chunky thumbs-up: a rounded-rect fist with a narrower rounded-rect
+// thumb overlapping its upper-left corner, sticking up -- same bold
+// rounded-rect vocabulary draw_die_face()'s die body already uses, kept
+// simple since this display has no room (or need) for finer hand detail.
+static void draw_thumbs_up_icon(uint8_t *fb)
+{
+    memset(fb, 0, WIDTH * HEIGHT / 8);
+    int cx = WIDTH / 2;
+    draw_rounded_rect(fb, cx + 4, 42, 34, 22, 8);  // fist
+    draw_rounded_rect(fb, cx - 8, 22, 14, 26, 6);  // thumb
+}
+
+esp_err_t face_display_show_wifi_searching(void)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    draw_wifi_icon(s_framebuffer);
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}
+
+// How long the thumbs-up stays up before returning -- long enough to
+// actually register as a confirmation, short enough not to noticeably
+// delay the rest of boot. Held here (like face_display_show_action()'s
+// own vTaskDelay) so callers don't need to manage this timing themselves.
+#define WIFI_CONNECTED_HOLD_MS 1500
+
+esp_err_t face_display_show_wifi_connected(void)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    draw_thumbs_up_icon(s_framebuffer);
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+    vTaskDelay(pdMS_TO_TICKS(WIFI_CONNECTED_HOLD_MS));
+    return err;
 }

@@ -235,3 +235,14 @@ esp_err_t audio_pipeline_write(const void *buf, size_t len)
 {
     return esp_codec_dev_write(s_play_dev, (void *)buf, len);
 }
+
+esp_err_t audio_pipeline_stop_playback(void)
+{
+    esp_codec_dev_close(s_play_dev);
+    // Same fs/volume as init_speaker_codec()'s original open -- see that
+    // function's own comment on why 80 (not esp_codec_dev_set_out_vol()'s
+    // max of 100).
+    esp_codec_dev_sample_info_t fs = { .sample_rate = 16000, .channel = 1, .bits_per_sample = 16 };
+    esp_codec_dev_set_out_vol(s_play_dev, 80);
+    return esp_codec_dev_open(s_play_dev, &fs);
+}

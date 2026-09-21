@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 if(IDF_TARGET STREQUAL "linux")
-    set(COMPONENTS main protocol orchestrator unity)
+    set(COMPONENTS main protocol orchestrator wifi_profiles unity)
 endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

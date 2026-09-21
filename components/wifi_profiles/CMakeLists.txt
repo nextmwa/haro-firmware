@@ -1,9 +1,9 @@
 if(IDF_TARGET STREQUAL "linux")
-    set(srcs "protocol.c" "test/test_protocol.c")
-    set(reqs cjson unity mbedtls)
+    set(srcs "wifi_profiles.c" "test/test_wifi_profiles.c")
+    set(reqs unity)
 else()
-    set(srcs "protocol.c")
-    set(reqs cjson mbedtls)
+    set(srcs "wifi_profiles.c")
+    set(reqs "")
 endif()
 
 idf_component_register(

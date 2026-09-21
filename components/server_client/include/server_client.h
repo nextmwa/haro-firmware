@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "protocol.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -14,6 +15,13 @@ typedef enum {
     SERVER_CLIENT_EVENT_PROTOCOL,
     SERVER_CLIENT_EVENT_AUDIO,
     SERVER_CLIENT_EVENT_DISCONNECTED,
+    // Mirrors DISCONNECTED: posted from WEBSOCKET_EVENT_CONNECTED, once per
+    // successful (re)connect, including automatic reconnects -- not just
+    // the first one. main.c uses the DISCONNECTED/CONNECTED pair to track
+    // "is the server currently reachable" independently of orchestrator's
+    // own conversation state machine (which only cares about a single
+    // transient disconnect flash, not the ongoing reachability).
+    SERVER_CLIENT_EVENT_CONNECTED,
 } server_client_event_type_t;
 
 typedef struct {
@@ -38,6 +46,12 @@ typedef struct {
 esp_err_t server_client_init(const char *url, const char *session_id, QueueHandle_t event_queue);
 esp_err_t server_client_send_audio_frame(const uint8_t *data, size_t len);
 esp_err_t server_client_send_end_of_speech(void);
+// See protocol_encode_interrupt()'s comment for when to call this.
+esp_err_t server_client_send_interrupt(void);
+// See protocol_encode_camera_frame()'s comment. Sent as a text (not
+// binary) WebSocket message -- protocol_encode_camera_frame() base64-
+// encodes the JPEG into the JSON payload itself.
+esp_err_t server_client_send_camera_frame(const uint8_t *jpeg, size_t jpeg_len);
 
 #ifdef __cplusplus
 }

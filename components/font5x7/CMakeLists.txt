@@ -1,9 +1,9 @@
 if(IDF_TARGET STREQUAL "linux")
-    set(srcs "protocol.c" "test/test_protocol.c")
-    set(reqs cjson unity mbedtls)
+    set(srcs "font5x7.c" "test/test_font5x7.c")
+    set(reqs unity)
 else()
-    set(srcs "protocol.c")
-    set(reqs cjson mbedtls)
+    set(srcs "font5x7.c")
+    set(reqs "")
 endif()
 
 idf_component_register(
