@@ -33,17 +33,25 @@ typedef struct {
 
 // Starts the WebSocket client (esp_websocket_client_start() under the hood,
 // which only spawns the client's internal task and returns -- it does not
-// block until connected). session_id is stored and used to send the
-// protocol `hello` message automatically once the connection actually
-// completes (WEBSOCKET_EVENT_CONNECTED, handled internally in
-// server_client.c), matching the reference Python client's
-// connect-then-hello sequencing (haro/src/haro/orchestrator.py). This also
-// means hello is (re)sent on every automatic reconnect, not just the first
-// connect. There is deliberately no public "send hello" entry point:
-// sending it before a real connection exists is guaranteed to fail (see
-// server_client.c's WEBSOCKET_EVENT_CONNECTED handler for the only call
-// site), so callers should not need one.
+// block until connected). session_id is stored and used by
+// server_client_send_hello() below.
 esp_err_t server_client_init(const char *url, const char *session_id, QueueHandle_t event_queue);
+// Sends the protocol `hello` message, matching the reference Python
+// client's connect-then-hello sequencing (haro/src/haro/orchestrator.py).
+// Call this in response to consuming a SERVER_CLIENT_EVENT_CONNECTED off
+// the event queue (posted once per successful (re)connect, including
+// automatic reconnects -- so this needs calling again on every one, not
+// just the first) -- never unconditionally at boot or from any other
+// context, since sending before a real connection exists is guaranteed to
+// fail. Deliberately NOT sent automatically inside server_client.c's own
+// WEBSOCKET_EVENT_CONNECTED handling anymore: that handler runs
+// synchronously on the WebSocket client's own internal task, and a send
+// stuck there (a silently black-holed connection, no RST) could freeze the
+// whole client -- and with it, the connection, forever, with no way back
+// short of a power cycle (found on real hardware; see server_client.c's
+// HELLO_SEND_TIMEOUT_MS comment for the full mechanism). Calling this from
+// main.c's orchestrator_task instead keeps it off that task entirely.
+esp_err_t server_client_send_hello(void);
 esp_err_t server_client_send_audio_frame(const uint8_t *data, size_t len);
 esp_err_t server_client_send_end_of_speech(void);
 // See protocol_encode_interrupt()'s comment for when to call this.

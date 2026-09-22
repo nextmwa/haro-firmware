@@ -62,59 +62,85 @@ static QueueHandle_t s_event_queue;
 //
 // NOT "one dropped/failed message during a rough network patch", though,
 // contrary to what an earlier version of this comment claimed: a timed-out
-// send here aborts the WHOLE connection (see HELLO_SEND_TIMEOUT's comment
-// below for the exact mechanism), so too tight a bound trades the
+// send here aborts the WHOLE connection (see esp_websocket_client_abort_
+// connection()'s mention in HELLO_SEND_TIMEOUT_MS's comment below for the
+// exact mechanism), so too tight a bound trades the
 // device-freeze risk for "drops mid-conversation on any network slower than
 // this value". 200ms (the original value) was too tight for a real
 // corporate network encountered in use -- raised to 1000ms as a middle
-// ground: still bounded (this file's three orchestrator_task sends can't
-// use HELLO_SEND_TIMEOUT's unbounded wait, since THEY can lock
-// up the device), but 5x more slack against the same kind of latency that
-// made hello/camera-frame sends fail below. main.c's audio-frame drain
-// loop also now caps how many sends it can stack in one iteration
-// (AUDIO_FRAME_DRAIN_BUDGET_MS), so a run of slow sends here can no longer
-// compound into a multi-second single-iteration stall the way it could
-// when this bound was raised without that change too.
+// ground: still tighter than HELLO_SEND_TIMEOUT_MS/CAMERA_FRAME_SEND_
+// TIMEOUT_MS below despite server_client_send_hello() now ALSO running on
+// orchestrator_task (see that constant's own comment for why it's still
+// deliberately looser than this one) -- these three fire on every single
+// conversational turn, so any added latency here is felt constantly, unlike
+// hello's rare, once-per-(re)connect timing. 5x more slack against the same
+// kind of latency that made hello/camera-frame sends fail below. main.c's
+// audio-frame drain loop also now caps how many sends it can stack in one
+// iteration (AUDIO_FRAME_DRAIN_BUDGET_MS), so a run of slow sends here can
+// no longer compound into a multi-second single-iteration stall the way it
+// could when this bound was raised without that change too.
 #define SEND_TIMEOUT_MS 1000
 
-// send_hello() and server_client_send_camera_frame() below are the two
-// exceptions to SEND_TIMEOUT_MS -- but NOT the same bound as each other
-// (see CAMERA_FRAME_SEND_TIMEOUT_MS below for why they diverged after
-// starting out identical). Found on real hardware (a corporate WiFi
+// server_client_send_hello() and server_client_send_camera_frame() below
+// are the two exceptions to SEND_TIMEOUT_MS -- but NOT the same bound as
+// each other (see CAMERA_FRAME_SEND_TIMEOUT_MS below for why they diverged
+// after starting out identical). Found on real hardware (a corporate WiFi
 // network with more latency than the network SEND_TIMEOUT_MS was tuned
 // against): a failed send here isn't a harmless skip of that one message
 // -- esp_websocket_client_send_with_exact_opcode() calls
 // esp_websocket_client_abort_connection() on ANY write that doesn't
 // complete in time ("Calling abort_connection due to send error", in
 // esp_websocket_client.c), tearing down the WHOLE connection over a single
-// slow write. camera_face_track.c's own comment on its send call ("a
-// camera frame that can't go out in 200ms is simply skipped") was wrong
-// about this for exactly that reason -- a base64-encoded JPEG (several KB,
-// far bigger than any other message this file sends) plus a fresh TCP
-// connection still in slow-start is routinely slower than 200ms on this
-// network, and every one of those "skips" was actually killing the
-// connection and forcing a reconnect, repeating forever. Neither call
-// site runs on orchestrator_task's loop (send_hello() runs from
-// esp_websocket_client's own internal task via WEBSOCKET_EVENT_CONNECTED;
-// server_client_send_camera_frame() runs from camera_face_track.c's own
-// face_track_task) -- so the lockup risk that justifies SEND_TIMEOUT_MS's
-// 200ms bound on orchestrator_task's own sends (audio frames, end-of-
-// speech, interrupt) does not apply to either of these.
+// slow write.
 //
-// Even 5000ms here wasn't enough on real hardware (a corporate network):
-// confirmed on real hardware by raising this to 5000ms and watching the
-// SAME "WebSocket connected" -> abort cycle recur, just ~5s later instead
-// of ~200ms, so this was raised again, to unbounded (portMAX_DELAY) --
-// restoring the behavior these two sends had before SEND_TIMEOUT_MS
-// existed (an earlier, separate fix, for the three orchestrator_task-
-// bound sends below, where an unbounded wait really did freeze the whole
-// device for 30+ seconds). This is send_hello()'s final value: it runs
-// once per connection and is tiny (one short JSON message), so there's no
-// real downside to letting it wait as long as the network needs.
-#define HELLO_SEND_TIMEOUT portMAX_DELAY
+// HELLO_SEND_TIMEOUT_MS went through unbounded (portMAX_DELAY) before this
+// value -- found, root-caused on real hardware, to be a MUCH worse bug than
+// the one it was trying to fix. Sending hello used to happen synchronously
+// inside websocket_event_handler()'s WEBSOCKET_EVENT_CONNECTED case, which
+// esp_websocket_client.c calls via esp_websocket_client_dispatch_event() ->
+// esp_event_loop_run() -- run SYNCHRONOUSLY, on the WebSocket client's own
+// internal task, while that same task is still holding client->lock (see
+// esp_websocket_client.c's WEBSOCKET_STATE_INIT case, which doesn't release
+// client->lock until after this whole dispatch returns). A portMAX_DELAY
+// send stuck there (a silently black-holed connection with no RST, exactly
+// the kind of thing a corporate WiFi network produces more often than a
+// clean home one -- confirmed as the actual failure mode in the field) then
+// blocks that task FOREVER, still holding client->lock -- which stops the
+// WHOLE esp_websocket_client state machine dead: no more PING/PONG, no more
+// disconnect detection, no more automatic reconnect, because all of that
+// logic runs on the very same now-frozen task. The device is left
+// "connected" forever from the library's own point of view while actually
+// dead on the wire, recoverable only by a physical power cycle -- this is
+// what "loses the connection and never reconnects" (as opposed to the
+// flaky-but-recovering disconnect/reconnect cycling this file's other
+// comments describe) turned out to actually be.
+//
+// Fixed by moving the hello send off the WebSocket client's own internal
+// task entirely: websocket_event_handler()'s WEBSOCKET_EVENT_CONNECTED case
+// below now only enqueues SERVER_CLIENT_EVENT_CONNECTED (as it already did)
+// -- main.c's orchestrator_task calls the now-public
+// server_client_send_hello() in response to consuming that event, the same
+// task its three other calls into this file (audio frame, end-of-speech,
+// interrupt, all SEND_TIMEOUT_MS-bound) already run on. With the send now
+// off the client's own internal task, there's no lockup-the-whole-library
+// risk left to justify staying unbounded -- bounded the same way
+// CAMERA_FRAME_SEND_TIMEOUT_MS is, for the same reason: generous enough for
+// a real slow network (hello is tiny -- one short JSON message), but
+// bounded so a stuck send can no longer freeze anything indefinitely.
+// Deliberately NOT as tight as SEND_TIMEOUT_MS despite now sharing
+// orchestrator_task with those three sends: hello only fires once per
+// (re)connect, not on every conversational turn, so an occasional multi-
+// second stall right after reconnecting (worst case: this whole value,
+// delaying orchestrator_task's wake-word/audio-draining/display work for
+// that long) is a far smaller practical cost than the same stall would be
+// on the three per-turn sends -- and after HELLO_SEND_TIMEOUT_MS elapses,
+// esp_websocket_client_abort_connection() runs and reconnection proceeds
+// normally regardless, the same recoverable failure mode SEND_TIMEOUT_MS's
+// own comment already describes.
+#define HELLO_SEND_TIMEOUT_MS 8000
 
-// server_client_send_camera_frame() started out sharing
-// HELLO_SEND_TIMEOUT's unbounded wait too -- reverted after that choice
+// server_client_send_camera_frame() started out sharing hello's (then-)
+// unbounded wait too -- reverted after that choice
 // caused a DIFFERENT real disconnect, root-caused by reading uvicorn's
 // actual Config defaults (ws_ping_interval=20.0, ws_ping_timeout=20.0,
 // neither overridden anywhere in haro-server) against this library's own
@@ -168,23 +194,31 @@ static size_t s_audio_reassembly_total; // expected total, from payload_len
 #define MAX_SESSION_ID_LEN 64
 static char s_session_id[MAX_SESSION_ID_LEN];
 
-// Sends the protocol `hello` message. Only ever called from
-// websocket_event_handler() below, in response to a real
-// WEBSOCKET_EVENT_CONNECTED -- esp_websocket_client_send_text() (via
+// Sends the protocol `hello` message. Public (not static): called from
+// main.c's orchestrator_task, in response to consuming a
+// SERVER_CLIENT_EVENT_CONNECTED off the event queue -- deliberately NOT
+// called synchronously from websocket_event_handler()'s own
+// WEBSOCKET_EVENT_CONNECTED case anymore (see HELLO_SEND_TIMEOUT_MS's
+// comment above for the real-hardware bug that caused: calling it there ran
+// this send on the WebSocket client's own internal task while it held
+// client->lock, and a stuck send could freeze the whole client, and hence
+// the connection, forever). esp_websocket_client_send_text() (via
 // esp_websocket_client_send_with_exact_opcode()) checks
 // esp_websocket_client_is_connected() first and fails immediately if not
-// connected yet, so this must never be called unconditionally at boot
-// (that was Finding 2 of the final review: server_client_send_hello() used
-// to be called synchronously right after server_client_init(), before
-// esp_websocket_client_start()'s internally-spawned task could possibly
-// have connected).
-static esp_err_t send_hello(void)
+// connected yet, so this must never be called unconditionally at boot (that
+// was Finding 2 of an earlier whole-codebase review: server_client_send_
+// hello() used to be called synchronously right after server_client_init(),
+// before esp_websocket_client_start()'s internally-spawned task could
+// possibly have connected) -- calling it only in response to a real,
+// already-observed SERVER_CLIENT_EVENT_CONNECTED (posted only from a real
+// WEBSOCKET_EVENT_CONNECTED, see below) keeps that guarantee.
+esp_err_t server_client_send_hello(void)
 {
     char *json = protocol_encode_hello(s_session_id);
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), HELLO_SEND_TIMEOUT);
+    int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), pdMS_TO_TICKS(HELLO_SEND_TIMEOUT_MS));
     free(json);
     return sent >= 0 ? ESP_OK : ESP_FAIL;
 }
@@ -259,11 +293,19 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
     }
     case WEBSOCKET_EVENT_CONNECTED: {
-        ESP_LOGI(TAG, "WebSocket connected, sending hello (session=%s)", s_session_id);
-        esp_err_t err = send_hello();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "failed to send hello: %s", esp_err_to_name(err));
-        }
+        // Deliberately NOT calling server_client_send_hello() here anymore
+        // -- see HELLO_SEND_TIMEOUT_MS's comment for why running that send
+        // on THIS task (the WebSocket client's own internal task, which
+        // this handler runs on synchronously) could freeze the whole
+        // connection forever. main.c's orchestrator_task sends hello
+        // instead, once it consumes the SERVER_CLIENT_EVENT_CONNECTED
+        // posted just below. On the rare case this event is itself dropped
+        // (queue full, same "event queue full" log as every other event
+        // this file posts), hello is simply skipped for that connection --
+        // a real, minor tradeoff for no longer risking a permanent freeze;
+        // the next successful (re)connect posts CONNECTED again and gets
+        // another chance.
+        ESP_LOGI(TAG, "WebSocket connected (session=%s)", s_session_id);
         server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_CONNECTED };
         if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
             ESP_LOGW(TAG, "event queue full, dropping connected event");
@@ -303,7 +345,7 @@ esp_err_t server_client_init(const char *url, const char *session_id, QueueHandl
         // 10s". (Briefly suspected this setting of causing the connect-
         // then-immediately-drop bug below -- ruled out by reverting it on
         // real hardware and seeing the exact same failure; the real cause
-        // was HELLO_SEND_TIMEOUT's/CAMERA_FRAME_SEND_TIMEOUT_MS's,
+        // was HELLO_SEND_TIMEOUT_MS's/CAMERA_FRAME_SEND_TIMEOUT_MS's,
         // unrelated to this config.)
         .network_timeout_ms = 9000,
         .reconnect_timeout_ms = 1000,
@@ -360,15 +402,19 @@ esp_err_t server_client_send_camera_frame(const uint8_t *jpeg, size_t jpeg_len)
     // esp_websocket_client_send_text() fragments large payloads into
     // multiple WebSocket frames internally -- a base64-encoded JPEG
     // (several KB, far bigger than any other message this file sends)
-    // needs a longer, non-orchestrator-task bound than SEND_TIMEOUT_MS,
-    // same as send_hello() -- but NOT the same unbounded wait: see
+    // needs a longer bound than SEND_TIMEOUT_MS, similar in spirit to
+    // server_client_send_hello()'s HELLO_SEND_TIMEOUT_MS -- but NOT the
+    // same unbounded wait that constant briefly went through: see
     // CAMERA_FRAME_SEND_TIMEOUT_MS's comment for why going unbounded here
     // specifically caused a different real disconnect (this send repeats
     // every poll cycle, unlike hello's once-per-connection). Bounded, this
     // call is still expected to sometimes fail outright on a slow network
     // -- camera_face_track.c sends a fresh frame every FACE_TRACK_POLL_MS
     // anyway, so losing one is a non-issue, same as always. That file's
-    // own face_track_task calls this, not orchestrator_task.
+    // own face_track_task calls this, not orchestrator_task (unlike hello,
+    // which now runs on orchestrator_task -- see server_client_send_
+    // hello()'s own comment for why moving it there, off THIS function's
+    // task, was the actual fix for a real connection-freeze bug).
     int sent = esp_websocket_client_send_text(s_client, json, (int)strlen(json), pdMS_TO_TICKS(CAMERA_FRAME_SEND_TIMEOUT_MS));
     free(json);
     return sent >= 0 ? ESP_OK : ESP_FAIL;

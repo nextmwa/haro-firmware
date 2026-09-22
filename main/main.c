@@ -689,6 +689,17 @@ static void orchestrator_task(void *arg)
                                                        server_evt.protocol_event.face_dy);
             } else if (server_evt.type == SERVER_CLIENT_EVENT_CONNECTED) {
                 s_server_reachable = true;
+                // Deliberately called here, on orchestrator_task, not from
+                // inside server_client.c's own WEBSOCKET_EVENT_CONNECTED
+                // handler -- see server_client_send_hello()'s header
+                // comment (server_client.h) for the real-hardware bug that
+                // moving it here fixes: a stuck send there could freeze
+                // the whole WebSocket client, and with it the connection,
+                // forever.
+                esp_err_t hello_err = server_client_send_hello();
+                if (hello_err != ESP_OK) {
+                    ESP_LOGW(TAG, "failed to send hello: %s", esp_err_to_name(hello_err));
+                }
             } else {
                 s_server_reachable = (server_evt.type != SERVER_CLIENT_EVENT_DISCONNECTED);
                 orchestrator_on_server_event(to_orchestrator_event(&server_evt));
