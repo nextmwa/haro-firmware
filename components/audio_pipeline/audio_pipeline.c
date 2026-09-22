@@ -21,6 +21,13 @@ static i2s_chan_handle_t s_rx_handle;
 static esp_codec_dev_handle_t s_record_dev;
 static esp_codec_dev_handle_t s_play_dev;
 
+// Last volume applied via audio_pipeline_set_volume_percent() (or the
+// init-time default, 80, before that's ever been called) -- see that
+// function's header comment for why this needs to be remembered rather
+// than re-applying a fixed literal every time audio_pipeline_stop_
+// playback() reopens the codec.
+static int s_volume_percent = 80;
+
 static esp_err_t init_i2c(void)
 {
     i2c_master_bus_config_t bus_config = {
@@ -192,8 +199,11 @@ static esp_err_t init_speaker_codec(void)
     // Found on real hardware (once TCA9555_PA_EN was fixed and sound was
     // actually audible for the first time): 60 was quiet even close up, but
     // 100 (max) was too loud. esp_codec_dev_set_out_vol()'s `volume` is
-    // 0-100, mapped internally to the ES8311's dB gain curve.
-    esp_codec_dev_set_out_vol(s_play_dev, 80);
+    // 0-100, mapped internally to the ES8311's dB gain curve. s_volume_
+    // percent starts at that same 80 default (see its own declaration) --
+    // main.c overrides it right after audio_pipeline_init() returns, once
+    // it's read the persisted volume level from NVS.
+    esp_codec_dev_set_out_vol(s_play_dev, s_volume_percent);
     return esp_codec_dev_open(s_play_dev, &fs);
 }
 
@@ -239,10 +249,32 @@ esp_err_t audio_pipeline_write(const void *buf, size_t len)
 esp_err_t audio_pipeline_stop_playback(void)
 {
     esp_codec_dev_close(s_play_dev);
-    // Same fs/volume as init_speaker_codec()'s original open -- see that
-    // function's own comment on why 80 (not esp_codec_dev_set_out_vol()'s
-    // max of 100).
+    // Same fs as init_speaker_codec()'s original open. Volume: re-applies
+    // s_volume_percent (the last value set via audio_pipeline_set_volume_
+    // percent(), not a hardcoded literal) -- esp_codec_dev_close()/open()
+    // doesn't remember volume across the cycle on its own, and this
+    // function runs after every spoken reply, so a hardcoded value here
+    // would silently undo any runtime volume change on the very next turn.
     esp_codec_dev_sample_info_t fs = { .sample_rate = 16000, .channel = 1, .bits_per_sample = 16 };
-    esp_codec_dev_set_out_vol(s_play_dev, 80);
+    esp_codec_dev_set_out_vol(s_play_dev, s_volume_percent);
     return esp_codec_dev_open(s_play_dev, &fs);
+}
+
+esp_err_t audio_pipeline_set_volume_percent(int percent)
+{
+    if (percent < 0 || percent > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_volume_percent = percent;
+    if (s_play_dev == NULL) {
+        // Not yet initialized -- s_volume_percent is still recorded and
+        // will be applied by init_speaker_codec()'s own esp_codec_dev_
+        // set_out_vol() call once audio_pipeline_init() runs. Not an
+        // error: main.c can legitimately call this before audio_pipeline_
+        // init() only if it reads NVS before initializing audio, which
+        // isn't the current boot order, but there's no reason to force
+        // callers to know that.
+        return ESP_OK;
+    }
+    return esp_codec_dev_set_out_vol(s_play_dev, percent);
 }

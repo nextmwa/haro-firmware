@@ -14,6 +14,7 @@ void app_main(void)
 #include "haro_config.h"
 #include "haro_wifi_provisioning.h"
 #include "audio_pipeline.h"
+#include "buttons.h"
 #include "wake_word.h"
 #include "server_client.h"
 #include "face_display.h"
@@ -203,6 +204,45 @@ static orchestrator_server_event_t to_orchestrator_event(const server_client_eve
 // no progress at all, not a latency bound.
 #define MAX_THINKING_SPEAKING_MS 60000
 
+// KEY1/KEY3 volume buttons (buttons.c). BUTTON_POLL_MS: how often to read
+// the TCA9555 for a new press -- a button only needs to be noticed within
+// this window, not on every ~20ms loop iteration, so this is throttled the
+// same way the cosmetic redraw blocks below are. VOLUME_ICON_HOLD_MS: how
+// long the speaker icon/bar stays on screen after the last press before
+// yielding the display back to whatever else would normally be showing
+// (eyes, error screen, ...) -- long enough to read the level at a glance,
+// short enough not to get in the way of pressing the buttons repeatedly to
+// reach a target level.
+#define BUTTON_POLL_MS 100
+#define VOLUME_ICON_HOLD_MS 4000
+
+// haro_config_set_volume_level() commits a write to NVS (flash). Flash
+// WRITES (unlike reads) go through spi_flash_disable_interrupts_caches_
+// and_other_cpu(), which briefly disables cache -- and therefore PSRAM --
+// access on every core, and ESP-IDF itself asserts
+// (esp_task_stack_is_sane_cache_disabled()) if the CALLING task's own
+// stack lives in PSRAM, since that task couldn't keep running (its own
+// stack would be unreachable) for the duration of the disable. Confirmed
+// on real hardware: calling haro_config_set_volume_level() directly from
+// orchestrator_task -- whose stack IS in PSRAM, deliberately, see its own
+// xTaskCreateWithCaps() call below -- crashed with exactly that assert on
+// every single KEY1/KEY3 press, rebooting the whole device before the
+// volume icon ever got a chance to draw. Persisting from a small, one-shot
+// task instead (plain xTaskCreate(), no WithCaps -- its stack lands in
+// internal RAM) sidesteps this entirely: created fresh per press, runs
+// for microseconds, deletes itself. Reads (haro_config_get_volume_level(),
+// called once at this task's own startup below) don't have this problem
+// -- only writes/erases trigger the all-cores cache-disable path.
+static void persist_volume_level_task(void *arg)
+{
+    uint8_t level = (uint8_t)(uintptr_t)arg;
+    esp_err_t err = haro_config_set_volume_level(level);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to persist volume level %u: %s", (unsigned)level, esp_err_to_name(err));
+    }
+    vTaskDelete(NULL);
+}
+
 // Idle-animation timing, in milliseconds. Tunable; not exposed via Kconfig
 // since these are purely cosmetic defaults, not a hardware/protocol
 // constant. See the idle-animation block in orchestrator_task() below.
@@ -369,6 +409,19 @@ static void orchestrator_task(void *arg)
     #define MUSIC_INTERRUPT_FORWARDING_HOLD_MS 300
     TickType_t forwarding_hold_until = 0;
 
+    // Volume buttons (KEY1/KEY3, buttons.c) -- read the persisted level
+    // once here (not in app_main(), to keep this task's own polling state
+    // declared and initialized in one place, the same way every other
+    // local above is) and apply it immediately, overriding init_speaker_
+    // codec()'s compile-time 80% default.
+    uint8_t volume_level = 8;
+    if (haro_config_get_volume_level(&volume_level) != ESP_OK) {
+        volume_level = 8;
+    }
+    audio_pipeline_set_volume_percent((int)volume_level * 10);
+    TickType_t next_button_poll = 0;
+    TickType_t volume_icon_until = 0; // 0 = icon not currently showing
+
     while (true) {
         wake_word_event_type_t wake_evt;
         while (xQueueReceive(s_wake_queue, &wake_evt, 0) == pdTRUE) {
@@ -468,6 +521,46 @@ static void orchestrator_task(void *arg)
 
         TickType_t now = xTaskGetTickCount();
 
+        // Volume buttons (KEY1/KEY3, buttons.c): KEY1 raises the level,
+        // KEY3 lowers it (KEY2 unused for now, per the current scope --
+        // buttons_poll() already reports it, nothing here reacts to it).
+        // Throttled to BUTTON_POLL_MS -- see that constant's comment.
+        if (now >= next_button_poll) {
+            button_id_t pressed;
+            if (buttons_poll(&pressed) && (pressed == BUTTON_KEY1 || pressed == BUTTON_KEY3)) {
+                if (pressed == BUTTON_KEY1 && volume_level < 10) {
+                    volume_level++;
+                } else if (pressed == BUTTON_KEY3 && volume_level > 1) {
+                    volume_level--;
+                }
+                audio_pipeline_set_volume_percent((int)volume_level * 10);
+                // Off orchestrator_task entirely -- see persist_volume_
+                // level_task()'s own comment for why calling haro_config_
+                // set_volume_level() directly here crashes the device.
+                BaseType_t persist_task_created = xTaskCreate(
+                    persist_volume_level_task, "persist_vol", 3072,
+                    (void *)(uintptr_t)volume_level, tskIDLE_PRIORITY + 1, NULL);
+                if (persist_task_created != pdPASS) {
+                    ESP_LOGW(TAG, "xTaskCreate(persist_volume_level_task) failed: %d -- volume level not persisted this press",
+                             (int)persist_task_created);
+                }
+                face_display_set_volume_icon((int)volume_level);
+                volume_icon_until = now + pdMS_TO_TICKS(VOLUME_ICON_HOLD_MS);
+            }
+            next_button_poll = now + pdMS_TO_TICKS(BUTTON_POLL_MS);
+        }
+        // Known minor tradeoff, not fixed here (out of scope for now): if a
+        // real state change (e.g. a wake word) draws over the volume icon
+        // before this window naturally expires, eye-liveliness/blink/idle-
+        // fidget stay suppressed (see eyes_and_led_allowed below) for the
+        // rest of the window even though the icon itself is no longer
+        // showing -- a few seconds of missed cosmetic liveliness at most,
+        // never a stuck or wrong screen.
+        bool showing_volume_icon = (volume_icon_until != 0) && (now < volume_icon_until);
+        if (volume_icon_until != 0 && now >= volume_icon_until) {
+            volume_icon_until = 0; // expired -- eyes_and_led_allowed's own blocks redraw naturally below
+        }
+
         // Eye liveliness: a tracked face wins outright when one's present
         // (camera_face_track_get_offset() is just an atomic read -- cheap,
         // safe every tick); otherwise pick a new small random saccade
@@ -486,7 +579,8 @@ static void orchestrator_task(void *arg)
         // over s_framebuffer). Face tracking also has nothing useful to
         // show while unreachable, since face detection is itself
         // server-side (no face_position events can arrive).
-        bool eyes_and_led_allowed = s_server_reachable && orchestrator_get_state() != HARO_STATE_PLAYING_MUSIC;
+        bool eyes_and_led_allowed = s_server_reachable && orchestrator_get_state() != HARO_STATE_PLAYING_MUSIC &&
+                                     !showing_volume_icon;
         if (eyes_and_led_allowed) {
             if (now >= saccade_next_pick) {
                 int range = 2 * SACCADE_MAX_PX + 1;
@@ -556,7 +650,7 @@ static void orchestrator_task(void *arg)
         // Losing s_server_reachable resets this the same way any other
         // non-idle state already does (the `else` below), so idle fidgets
         // resume cleanly once reachable again.
-        if (orchestrator_get_state() == HARO_STATE_IDLE && s_server_reachable) {
+        if (orchestrator_get_state() == HARO_STATE_IDLE && s_server_reachable && !showing_volume_icon) {
             if (!was_idle) {
                 was_idle = true;
                 idle_since = now;
@@ -627,8 +721,13 @@ static void orchestrator_task(void *arg)
         // driven by polling state the same way the idle fidgets above are
         // -- see face_display_set_music_notes()'s header comment for why
         // this can't just be a single blocking call like the dice/coin
-        // reveal.
-        if (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC) {
+        // reveal. Gated on !showing_volume_icon for the same reason
+        // eyes_and_led_allowed is above: without it, this block's own
+        // 100ms redraw would overwrite a just-shown volume icon almost
+        // immediately, the exact "two blocks independently redrawing,
+        // fighting over s_framebuffer" hazard the error-text block's own
+        // comment already describes for a different pair of overlays.
+        if (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC && !showing_volume_icon) {
             if (now >= music_next_update) {
                 music_scroll_offset += 3;
                 face_display_set_music_notes(music_scroll_offset);
@@ -645,8 +744,12 @@ static void orchestrator_task(void *arg)
         // throttle-the-redraw pattern as the blocks above. Re-asserts the
         // red LED on every redraw (not just once on entry) as cheap
         // defense-in-depth against anything else touching status_led while
-        // this is showing.
-        if (!s_server_reachable) {
+        // this is showing. Gated on !showing_volume_icon for the same
+        // "don't fight over the framebuffer with another independently-
+        // redrawing overlay" reason as the music-notes block above -- a
+        // volume adjustment while unreachable still gets its 4s of screen
+        // time before the error text resumes.
+        if (!s_server_reachable && !showing_volume_icon) {
             if (now >= error_next_update) {
                 error_scroll_offset += 2;
                 face_display_set_scrolling_text(s_server_error_text, error_scroll_offset);
@@ -822,6 +925,15 @@ void app_main(void)
     esp_err_t cam_err = camera_face_track_init();
     if (cam_err != ESP_OK) {
         ESP_LOGW(TAG, "camera_face_track_init() failed: %s -- continuing without face tracking", esp_err_to_name(cam_err));
+    }
+
+    // Same shared I2C bus as face_display above (this board has only one).
+    // Non-fatal on failure, same reasoning as every other optional
+    // peripheral here -- no TCA9555 found means no volume buttons, not a
+    // broken device.
+    esp_err_t buttons_err = buttons_init(i2c_bus);
+    if (buttons_err != ESP_OK) {
+        ESP_LOGW(TAG, "buttons_init() failed: %s -- continuing without volume buttons", esp_err_to_name(buttons_err));
     }
 
     char server_url[128];

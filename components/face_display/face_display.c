@@ -906,3 +906,106 @@ esp_err_t face_display_show_wifi_connected(void)
     vTaskDelay(pdMS_TO_TICKS(WIFI_CONNECTED_HOLD_MS));
     return err;
 }
+
+// --- Volume level (main.c, in response to the KEY1/KEY3 buttons) --------
+//
+// Same "replaces the eyes entirely, one-off overlay, doesn't touch
+// s_current_pose" contract as the WiFi status icons above -- not a mood,
+// so not part of face_display_show()'s cross-fading system. Unlike those
+// (shown once, held for a fixed duration via this file's own vTaskDelay),
+// this draws once per call and returns immediately -- main.c owns the
+// multi-second auto-return-to-normal timing itself (same "caller decides
+// when to stop calling/showing something else" contract as face_display_
+// set_scrolling_text()/set_music_notes(), just without needing repeated
+// calls to animate an otherwise-static image).
+
+#define VOLUME_BAR_SEGMENT_COUNT 10
+#define VOLUME_BAR_SEGMENT_W 5
+#define VOLUME_BAR_SEGMENT_GAP 2
+#define VOLUME_BAR_H 28
+#define VOLUME_BAR_X0 46
+#define VOLUME_ICON_CX 20
+
+// A speaker glyph -- a small housing (filled square) feeding a cone that
+// widens to the right (per-column scanline fill, since draw_rounded_rect()
+// only covers plain rectangles), plus two short sound-wave arcs beyond the
+// cone's mouth, using the same arc-sweep technique as draw_wifi_icon()
+// above (a smaller sweep/radius here since this icon shares the screen
+// with the volume bar, unlike WiFi's icon which has the whole display).
+static void draw_speaker_icon(uint8_t *fb, int cx, int cy)
+{
+    draw_rounded_rect(fb, cx - 5, cy, 8, 12, 1); // housing, spans roughly x:[cx-9, cx-1]
+    int x0 = cx - 1, x1 = cx + 9;
+    double h0 = 6.0, h1 = 12.0; // cone half-height: matches the housing's own half-height, widens to the mouth
+    for (int x = x0; x <= x1; x++) {
+        double t = (double)(x - x0) / (double)(x1 - x0);
+        int half_h = (int)lround(h0 + (h1 - h0) * t);
+        for (int y = cy - half_h; y <= cy + half_h; y++) {
+            set_pixel(fb, x, y);
+        }
+    }
+    const double start_deg = -40.0, end_deg = 40.0;
+    const int radii[2] = { 6, 11 };
+    const int steps = 8;
+    for (int a = 0; a < 2; a++) {
+        for (int i = 0; i < steps; i++) {
+            double t0 = (start_deg + (end_deg - start_deg) * i / steps) * M_PI / 180.0;
+            double t1 = (start_deg + (end_deg - start_deg) * (i + 1) / steps) * M_PI / 180.0;
+            draw_thick_line(fb, cx + 10 + radii[a] * cos(t0), cy - radii[a] * sin(t0),
+                             cx + 10 + radii[a] * cos(t1), cy - radii[a] * sin(t1), 2);
+        }
+    }
+}
+
+static void draw_hollow_rect(uint8_t *fb, int x0, int y0, int w, int h)
+{
+    for (int x = x0; x < x0 + w; x++) {
+        set_pixel(fb, x, y0);
+        set_pixel(fb, x, y0 + h - 1);
+    }
+    for (int y = y0; y < y0 + h; y++) {
+        set_pixel(fb, x0, y);
+        set_pixel(fb, x0 + w - 1, y);
+    }
+}
+
+// 10 vertical segments left-to-right, `level` of them filled solid, the
+// rest drawn as a hollow outline -- a "how many of 10 slots are filled"
+// bar, not an equalizer (uniform height, not stepped), so it reads
+// unambiguously as a level indicator at a glance.
+static void draw_volume_bar(uint8_t *fb, int level)
+{
+    int y0 = HEIGHT / 2 - VOLUME_BAR_H / 2;
+    for (int i = 0; i < VOLUME_BAR_SEGMENT_COUNT; i++) {
+        int x = VOLUME_BAR_X0 + i * (VOLUME_BAR_SEGMENT_W + VOLUME_BAR_SEGMENT_GAP);
+        if (i < level) {
+            for (int dx = 0; dx < VOLUME_BAR_SEGMENT_W; dx++) {
+                for (int dy = 0; dy < VOLUME_BAR_H; dy++) {
+                    set_pixel(fb, x + dx, y0 + dy);
+                }
+            }
+        } else {
+            draw_hollow_rect(fb, x, y0, VOLUME_BAR_SEGMENT_W, VOLUME_BAR_H);
+        }
+    }
+}
+
+// `level` is clamped to [1, VOLUME_BAR_SEGMENT_COUNT] rather than treated
+// as a caller error -- main.c's own level state is already kept in that
+// range, so this is defense-in-depth, not a documented failure mode.
+esp_err_t face_display_set_volume_icon(int level)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (level < 1) {
+        level = 1;
+    } else if (level > VOLUME_BAR_SEGMENT_COUNT) {
+        level = VOLUME_BAR_SEGMENT_COUNT;
+    }
+
+    memset(s_framebuffer, 0, WIDTH * HEIGHT / 8);
+    draw_speaker_icon(s_framebuffer, VOLUME_ICON_CX, HEIGHT / 2);
+    draw_volume_bar(s_framebuffer, level);
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}

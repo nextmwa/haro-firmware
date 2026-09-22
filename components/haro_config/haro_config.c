@@ -6,6 +6,8 @@
 
 #define NVS_NAMESPACE "haro"
 #define KEY_SERVER_URL "server_url"
+#define KEY_VOLUME_LEVEL "volume_level"
+#define DEFAULT_VOLUME_LEVEL 8
 
 esp_err_t haro_config_init(void)
 {
@@ -57,6 +59,39 @@ esp_err_t haro_config_set_server_url(const char *url)
         return err;
     }
     err = nvs_set_str(handle, KEY_SERVER_URL, url);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+esp_err_t haro_config_get_volume_level(uint8_t *out)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        err = nvs_get_u8(handle, KEY_VOLUME_LEVEL, out);
+        nvs_close(handle);
+    }
+
+    // Same "factory-fresh NVS is expected, not an error" fallback as
+    // haro_config_get_server_url() above.
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        *out = DEFAULT_VOLUME_LEVEL;
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t haro_config_set_volume_level(uint8_t level)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(handle, KEY_VOLUME_LEVEL, level);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }

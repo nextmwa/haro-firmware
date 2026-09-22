@@ -26,6 +26,17 @@ esp_err_t audio_pipeline_write(const void *buf, size_t len);
 // playback (TTS, the next track) resumes working immediately after.
 esp_err_t audio_pipeline_stop_playback(void);
 
+// Sets the playback volume (esp_codec_dev_set_out_vol()'s own 0-100 scale,
+// mapped internally to the ES8311's dB gain curve -- see init_speaker_
+// codec()'s comment for why 80, not 100, was the original fixed value).
+// Persists across audio_pipeline_stop_playback()'s close/reopen cycle
+// (which happens after every spoken reply, on every interrupt -- see that
+// function's own comment): without this persistence, any volume set here
+// would silently revert to the last-applied value the very next time
+// playback stops, which used to always be the hardcoded default. Safe to
+// call at any time, including before the first sound has played.
+esp_err_t audio_pipeline_set_volume_percent(int percent);
+
 // Returns the I2C bus (I2C_NUM_0, GPIO10=SCL/GPIO11=SDA) audio_pipeline_init()
 // created for the onboard ES8311/ES7210/TCA9555 codecs. Found on real
 // hardware: this is the SAME bus this board's 18-pin external header exposes

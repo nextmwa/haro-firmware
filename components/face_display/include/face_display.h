@@ -125,6 +125,19 @@ esp_err_t face_display_show_wifi_searching(void);
 // graphic.
 esp_err_t face_display_show_wifi_connected(void);
 
+// Draws a speaker icon plus a 10-segment volume bar (`level` of the 10
+// filled, the rest hollow), replacing the eyes entirely -- for main.c's
+// KEY1/KEY3 volume buttons. Same "replaces the eyes entirely, one-off
+// overlay, doesn't touch s_current_pose" contract as the functions above,
+// but unlike them, does NOT block or hold: draws once and returns
+// immediately, since there's nothing to animate -- the caller (main.c)
+// owns the "show for a few seconds then return to normal" timing itself,
+// the same way it already owns face_display_set_scrolling_text()'s/
+// face_display_set_music_notes()'s repeated-call timing. `level` is
+// clamped to [1, 10]. Returns ESP_ERR_INVALID_STATE if no display is
+// attached.
+esp_err_t face_display_set_volume_icon(int level);
+
 #ifdef __cplusplus
 }
 #endif
