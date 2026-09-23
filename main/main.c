@@ -216,23 +216,25 @@ static orchestrator_server_event_t to_orchestrator_event(const server_client_eve
 #define BUTTON_POLL_MS 100
 #define VOLUME_ICON_HOLD_MS 4000
 
-// haro_config_set_volume_level() commits a write to NVS (flash). Flash
-// WRITES (unlike reads) go through spi_flash_disable_interrupts_caches_
-// and_other_cpu(), which briefly disables cache -- and therefore PSRAM --
-// access on every core, and ESP-IDF itself asserts
-// (esp_task_stack_is_sane_cache_disabled()) if the CALLING task's own
-// stack lives in PSRAM, since that task couldn't keep running (its own
-// stack would be unreachable) for the duration of the disable. Confirmed
-// on real hardware: calling haro_config_set_volume_level() directly from
-// orchestrator_task -- whose stack IS in PSRAM, deliberately, see its own
-// xTaskCreateWithCaps() call below -- crashed with exactly that assert on
-// every single KEY1/KEY3 press, rebooting the whole device before the
-// volume icon ever got a chance to draw. Persisting from a small, one-shot
-// task instead (plain xTaskCreate(), no WithCaps -- its stack lands in
-// internal RAM) sidesteps this entirely: created fresh per press, runs
-// for microseconds, deletes itself. Reads (haro_config_get_volume_level(),
-// called once at this task's own startup below) don't have this problem
-// -- only writes/erases trigger the all-cores cache-disable path.
+// haro_config_set_volume_level()/haro_config_get_volume_level() both touch
+// NVS (flash) -- confirmed on real hardware (two separate crashes, two
+// separate captured backtraces) that BOTH can hit ESP-IDF's own
+// esp_task_stack_is_sane_cache_disabled() assert when called from
+// orchestrator_task, whose stack lives in PSRAM (deliberately, see its own
+// xTaskCreateWithCaps() call below): the WRITE crashed on every single
+// KEY1/KEY3 press (fixed first, below), and separately the READ this task
+// used to do at its own startup crashed on every single boot, before the
+// volume level was ever applied. (Reading ESP-IDF's real flash_ops/
+// spi_flash_os_func_app.c source afterward showed the exact mechanism is
+// more specific than a blanket "reads are always safe" -- it depends on
+// the flash driver's own internal mmap-page bookkeeping at the moment of
+// the call, not just read-vs-write -- but rather than keep chasing exactly
+// which NVS calls are safe under exactly which conditions, this file just
+// keeps ALL NVS access off orchestrator_task's PSRAM stack entirely:
+// haro_config_get_volume_level() now runs once in app_main(), on its own
+// safely-internal-RAM-stacked task, and the result is passed into
+// orchestrator_task as its creation argument (see xTaskCreateWithCaps()'s
+// call site) instead of being read from inside the task itself.
 static void persist_volume_level_task(void *arg)
 {
     uint8_t level = (uint8_t)(uintptr_t)arg;
@@ -322,8 +324,13 @@ static const idle_look_step_t IDLE_LOOK_STEPS[IDLE_LOOK_STEP_COUNT] = {
     { EXPR_LOOKING_LEFT,  350 },
 };
 
+// arg: the persisted volume level (1-10), read from NVS in app_main() --
+// see this file's comment on persist_volume_level_task() for why this
+// task must not touch NVS itself, including reading it, at startup.
 static void orchestrator_task(void *arg)
 {
+    uint8_t initial_volume_level = (uint8_t)(uintptr_t)arg;
+
     // Set when wake_word posts WAKE_WORD_SPEECH_END (see wake_word.c's
     // detect_task), consumed and cleared the next time an audio frame is
     // forwarded to orchestrator_on_audio_frame() below. wake_word's
@@ -409,15 +416,12 @@ static void orchestrator_task(void *arg)
     #define MUSIC_INTERRUPT_FORWARDING_HOLD_MS 300
     TickType_t forwarding_hold_until = 0;
 
-    // Volume buttons (KEY1/KEY3, buttons.c) -- read the persisted level
-    // once here (not in app_main(), to keep this task's own polling state
-    // declared and initialized in one place, the same way every other
-    // local above is) and apply it immediately, overriding init_speaker_
-    // codec()'s compile-time 80% default.
-    uint8_t volume_level = 8;
-    if (haro_config_get_volume_level(&volume_level) != ESP_OK) {
-        volume_level = 8;
-    }
+    // Volume buttons (KEY1/KEY3, buttons.c) -- initial_volume_level came in
+    // via this task's creation argument (read from NVS in app_main(), NOT
+    // here -- see the comment on this function's signature above and on
+    // persist_volume_level_task() for why). Applied immediately, overriding
+    // init_speaker_codec()'s compile-time 80% default.
+    uint8_t volume_level = initial_volume_level;
     audio_pipeline_set_volume_percent((int)volume_level * 10);
     TickType_t next_button_poll = 0;
     TickType_t volume_icon_until = 0; // 0 = icon not currently showing
@@ -1018,6 +1022,18 @@ void app_main(void)
         face_display_show(EXPR_IDLE);
     }
 
+    // Read once here, on app_main()'s own task (main_task -- internal-RAM
+    // stack, unlike orchestrator_task below) and passed in as that task's
+    // creation argument, rather than read from inside orchestrator_task
+    // itself -- see persist_volume_level_task()'s comment for why: an NVS
+    // read from orchestrator_task's PSRAM stack crashed the device on
+    // every single boot, confirmed on real hardware via a captured
+    // backtrace, before this fix.
+    uint8_t initial_volume_level = 8;
+    if (haro_config_get_volume_level(&initial_volume_level) != ESP_OK) {
+        initial_volume_level = 8;
+    }
+
     ESP_LOGI(TAG, "Haro ready, waiting for wake word");
     // xTaskCreateWithCaps(..., MALLOC_CAP_SPIRAM), not plain xTaskCreate():
     // found on real hardware that internal SRAM is down to ~2KB free by
@@ -1030,8 +1046,11 @@ void app_main(void)
     // ints/enums, no DMA-only-capable buffers) has no reason to need
     // internal-only memory, so moving its stack there is a clean fix. The
     // TCB itself still comes from internal RAM automatically (per
-    // idf_additions.h's doc comment) -- only the stack moves.
-    BaseType_t task_created = xTaskCreateWithCaps(orchestrator_task, "orchestrator", 4096, NULL, 5, NULL, MALLOC_CAP_SPIRAM);
+    // idf_additions.h's doc comment) -- only the stack moves. (NVS access
+    // is the one exception that genuinely needs to stay off this stack --
+    // see initial_volume_level above and persist_volume_level_task().)
+    BaseType_t task_created = xTaskCreateWithCaps(orchestrator_task, "orchestrator", 4096,
+                                                    (void *)(uintptr_t)initial_volume_level, 5, NULL, MALLOC_CAP_SPIRAM);
     if (task_created != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreateWithCaps(orchestrator_task) failed: %d", (int)task_created);
     }
