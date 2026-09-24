@@ -346,6 +346,12 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         }
         break;
     }
+    case WEBSOCKET_EVENT_CLOSED:
+        // A clean close handshake (server shut down/restarted) arrives as
+        // CLOSED, not DISCONNECTED -- see enable_close_reconnect in
+        // server_client_init(). Same consequences for the rest of Haro.
+        ESP_LOGW(TAG, "WebSocket closed by server, reconnecting");
+        // fallthrough
     case WEBSOCKET_EVENT_DISCONNECTED: {
         // Previously silent -- this case had no log line at all, so a
         // fast disconnect/reconnect cycle (the underlying esp_websocket_
@@ -417,6 +423,16 @@ esp_err_t server_client_init(const char *url, const char *session_id, QueueHandl
         .keep_alive_idle = 5,
         .keep_alive_interval = 5,
         .keep_alive_count = 3,
+        // Found on real hardware (2026-09-24): after a CLEAN server
+        // shutdown (uvicorn stopping/restarting sends a WebSocket CLOSE
+        // frame) esp_websocket_client, by default, ends its task for good
+        // -- `client->run = false` in esp_websocket_client.c's CLOSING
+        // branch, only WEBSOCKET_EVENT_CLOSED/FINISH are dispatched, no
+        // reconnect ever. Haro then sat silently "connected" to nothing
+        // until power-cycled, every time the server was restarted
+        // (abrupt drops were fine: they take the auto-reconnect path).
+        // This flag makes a clean close reconnect like any other drop.
+        .enable_close_reconnect = true,
     };
     s_client = esp_websocket_client_init(&config);
     if (s_client == NULL) {
