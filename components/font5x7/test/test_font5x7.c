@@ -38,9 +38,23 @@ TEST_CASE("every character used by the boot-time wake-word reminder prints a leg
     }
 }
 
+TEST_CASE("every character added for the KEY2 network-info screen prints a legible glyph", "[font5x7]")
+{
+    const char *chars = "cfjmpqtxz-_/";
+    for (const char *p = chars; *p != '\0'; p++) {
+        print_glyph(*p);
+    }
+}
+
+TEST_CASE("uppercase letters render as their lowercase glyph", "[font5x7]")
+{
+    TEST_ASSERT_EQUAL_PTR(font5x7_glyph('a'), font5x7_glyph('A'));
+    TEST_ASSERT_EQUAL_PTR(font5x7_glyph('z'), font5x7_glyph('Z'));
+}
+
 TEST_CASE("an unsupported character falls back to a blank glyph, not NULL", "[font5x7]")
 {
-    const uint8_t *cols = font5x7_glyph('Z'); // not in the supported set
+    const uint8_t *cols = font5x7_glyph('#'); // not in the supported set
     TEST_ASSERT_NOT_NULL(cols);
     for (int i = 0; i < FONT5X7_WIDTH; i++) {
         TEST_ASSERT_EQUAL_UINT8(0x00, cols[i]);

@@ -138,6 +138,20 @@ esp_err_t face_display_show_wifi_connected(void);
 // attached.
 esp_err_t face_display_set_volume_icon(int level);
 
+// KEY2 info screens (main.c): same draw-once, return-immediately overlay
+// contract as face_display_set_volume_icon() -- main.c decides when to
+// redraw and when to go back to the eyes.
+//
+// Network page: connected SSID, RSSI in dBm, `level` (0-10, clamped) as
+// text plus a 10-segment bar, and last ping round-trip. `ssid` NULL/empty
+// means "not connected" (rssi/level ignored, shown as "--"); `ping_ms` < 0
+// means no reply yet / timed out ("ping: --").
+esp_err_t face_display_set_network_info(const char *ssid, int rssi_dbm, int level, int ping_ms);
+
+// Up to ~5 lines of font5x7 text, each centered horizontally, the block
+// centered vertically. Lines wider than the display (21 glyphs) clip.
+esp_err_t face_display_set_text_lines(const char *const *lines, int count);
+
 #ifdef __cplusplus
 }
 #endif

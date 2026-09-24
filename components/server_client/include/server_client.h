@@ -61,6 +61,15 @@ esp_err_t server_client_send_interrupt(void);
 // encodes the JPEG into the JSON payload itself.
 esp_err_t server_client_send_camera_frame(const uint8_t *jpeg, size_t jpeg_len);
 
+// Milliseconds since the current connection's WEBSOCKET_EVENT_CONNECTED
+// fired, or -1 if never connected yet (or already disconnected again --
+// see server_client.c's WEBSOCKET_EVENT_DISCONNECTED case). Lets a
+// caller wait out a grace period on a freshly (re)connected client
+// before sending something -- see camera_face_track.c's
+// CAMERA_SEND_CONNECTION_WARMUP_MS for why that matters for camera
+// frames specifically.
+int64_t server_client_ms_since_connected(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -288,6 +288,28 @@ static bool try_connect_to_a_remembered_network(void)
 {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Disable WiFi modem-sleep power save (ESP-IDF's default is
+    // WIFI_PS_MIN_MODEM, on regardless of CONFIG_PM_ENABLE -- that's the
+    // system-wide power management framework, a separate setting, and
+    // it's off in this project's sdkconfig). Found on real hardware:
+    // Haro's server_client WebSocket connection dropped intermittently
+    // and unpredictably (connection durations from under a second to
+    // ~80s, no fixed period) with no code-level cause on either the
+    // firmware or haro-server side, and the drops persisted identically
+    // whether the server was reached through Docker's published-port
+    // NAT or through Docker Desktop's host-networking mode -- ruling out
+    // the server/Docker side entirely and pointing at the radio link
+    // itself. Modem sleep's periodic radio-off windows (to save power
+    // between DTIM beacons) are a well-known source of exactly this
+    // symptom on always-connected ESP32 WebSocket/streaming clients.
+    // Haro is a mains-powered desk device, never battery-powered, so the
+    // power saved by modem sleep has no value here and this is a pure
+    // reliability win with no real downside.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s -- modem sleep stays enabled",
+                 esp_err_to_name(ps_err));
+    }
 
     // Deliberately NOT registering the WIFI_EVENT handler yet: its
     // WIFI_EVENT_STA_START case would auto-connect using whatever STA

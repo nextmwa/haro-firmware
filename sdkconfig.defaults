@@ -103,3 +103,16 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # when send and receive data at the same time"), so a slow camera-frame
 # write no longer blocks answering the server's keepalive.
 CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+
+# esp32-camera (components/camera_face_track): let the camera's DMA land
+# directly in PSRAM instead of a ~30KB internal-RAM DMA bounce buffer
+# (cam_hal logged "PSRAM DMA mode disabled ... dma_buffer_size: 30720").
+# Found on real hardware (2026-09-23): after camera + AFE init, internal RAM
+# was down to ~4-8KB free with the largest free block at 1344-1536 bytes,
+# and every WiFi dynamic TX buffer allocation (1630 bytes,
+# MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL) failed as soon as audio streaming
+# started after the wake word -- no TCP segment could be transmitted, the
+# first audio-frame send blocked its full SEND_TIMEOUT_MS, and
+# esp_websocket_client aborted the connection. RSSI was a healthy -65..-68
+# dBm throughout; this was never a WiFi signal problem.
+CONFIG_CAMERA_PSRAM_DMA=y

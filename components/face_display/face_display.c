@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_random.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -1007,5 +1008,98 @@ esp_err_t face_display_set_volume_icon(int level)
     memset(s_framebuffer, 0, WIDTH * HEIGHT / 8);
     draw_speaker_icon(s_framebuffer, VOLUME_ICON_CX, HEIGHT / 2);
     draw_volume_bar(s_framebuffer, level);
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}
+
+// --- KEY2 info screens (main.c) -----------------------------------------
+//
+// Static multi-line text pages, same "replaces the eyes entirely, one-off
+// overlay, doesn't touch s_current_pose" contract as the volume icon above
+// and the same draw-once-and-return timing: main.c owns when to redraw
+// (the network page's values change) and when to leave.
+
+#define INFO_TEXT_ADVANCE_PX (FONT5X7_WIDTH + SCROLLING_TEXT_GLYPH_GAP_PX)
+#define INFO_LINE_SPACING_PX 12
+#define SIGNAL_BAR_SEGMENT_COUNT 10
+#define SIGNAL_BAR_SEGMENT_W 10
+#define SIGNAL_BAR_SEGMENT_GAP 2
+#define SIGNAL_BAR_H 8
+#define SIGNAL_BAR_Y0 33
+
+static int text_width_px(const char *text)
+{
+    int len = (int)strlen(text);
+    return len > 0 ? len * INFO_TEXT_ADVANCE_PX - SCROLLING_TEXT_GLYPH_GAP_PX : 0;
+}
+
+esp_err_t face_display_set_network_info(const char *ssid, int rssi_dbm, int level, int ping_ms)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool connected = (ssid != NULL && ssid[0] != '\0');
+    if (level < 0) {
+        level = 0;
+    } else if (level > SIGNAL_BAR_SEGMENT_COUNT) {
+        level = SIGNAL_BAR_SEGMENT_COUNT;
+    }
+
+    // 21 glyphs fit across 128px; an SSID longer than the space left after
+    // "wifi: " just clips at the right edge (set_pixel() bounds-checks).
+    char line[48];
+    memset(s_framebuffer, 0, WIDTH * HEIGHT / 8);
+    snprintf(line, sizeof(line), "wifi: %s", connected ? ssid : "non connesso");
+    draw_text(s_framebuffer, line, 0, 0);
+    if (connected) {
+        snprintf(line, sizeof(line), "segnale: %d db", rssi_dbm);
+    } else {
+        snprintf(line, sizeof(line), "segnale: --");
+    }
+    draw_text(s_framebuffer, line, 0, 11);
+    if (connected) {
+        snprintf(line, sizeof(line), "livello: %d/10", level);
+    } else {
+        snprintf(line, sizeof(line), "livello: --");
+    }
+    draw_text(s_framebuffer, line, 0, 22);
+
+    // Same filled-vs-hollow "how many of 10" vocabulary as draw_volume_bar(),
+    // laid out horizontally and shorter so it fits between text lines.
+    int bar_w = SIGNAL_BAR_SEGMENT_COUNT * (SIGNAL_BAR_SEGMENT_W + SIGNAL_BAR_SEGMENT_GAP) - SIGNAL_BAR_SEGMENT_GAP;
+    int bar_x0 = (WIDTH - bar_w) / 2;
+    for (int i = 0; i < SIGNAL_BAR_SEGMENT_COUNT; i++) {
+        int x = bar_x0 + i * (SIGNAL_BAR_SEGMENT_W + SIGNAL_BAR_SEGMENT_GAP);
+        if (connected && i < level) {
+            for (int dx = 0; dx < SIGNAL_BAR_SEGMENT_W; dx++) {
+                for (int dy = 0; dy < SIGNAL_BAR_H; dy++) {
+                    set_pixel(s_framebuffer, x + dx, SIGNAL_BAR_Y0 + dy);
+                }
+            }
+        } else {
+            draw_hollow_rect(s_framebuffer, x, SIGNAL_BAR_Y0, SIGNAL_BAR_SEGMENT_W, SIGNAL_BAR_H);
+        }
+    }
+
+    if (ping_ms >= 0) {
+        snprintf(line, sizeof(line), "ping: %d ms", ping_ms);
+    } else {
+        snprintf(line, sizeof(line), "ping: --");
+    }
+    draw_text(s_framebuffer, line, 0, 48);
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
+}
+
+esp_err_t face_display_set_text_lines(const char *const *lines, int count)
+{
+    if (s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memset(s_framebuffer, 0, WIDTH * HEIGHT / 8);
+    int block_h = count > 0 ? (count - 1) * INFO_LINE_SPACING_PX + FONT5X7_HEIGHT : 0;
+    int y = (HEIGHT - block_h) / 2;
+    for (int i = 0; i < count; i++) {
+        draw_text(s_framebuffer, lines[i], (WIDTH - text_width_px(lines[i])) / 2, y);
+        y += INFO_LINE_SPACING_PX;
+    }
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, WIDTH, HEIGHT, s_framebuffer);
 }

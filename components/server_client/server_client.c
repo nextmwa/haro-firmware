@@ -40,6 +40,7 @@
 #include "server_client.h"
 #include "esp_websocket_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -79,7 +80,26 @@ static QueueHandle_t s_event_queue;
 // iteration (AUDIO_FRAME_DRAIN_BUDGET_MS), so a run of slow sends here can
 // no longer compound into a multi-second single-iteration stall the way it
 // could when this bound was raised without that change too.
-#define SEND_TIMEOUT_MS 1000
+// Raised again, 1000 -> 3000, after real-hardware testing on a different
+// network (this project's own development WiFi) hit the exact same
+// pattern the 200->1000 raise above already documents: audio-frame sends
+// during LISTENING failing and tearing down the connection mid-turn
+// (confirmed via added logging -- server_client.c's WEBSOCKET_EVENT_
+// DISCONNECTED case and orchestrator.c's DISCONNECTED handler were both
+// completely silent before that, so this failure mode was invisible on
+// the serial console despite visibly happening: a red EXPR_ERROR flash
+// on every wake word). Ruled out first: WiFi modem-sleep power save
+// (esp_wifi_set_ps(WIFI_PS_NONE), no change), TCP keepalive
+// (server_client_init()'s keep_alive_* fields, no change), and Docker
+// Desktop's port-forwarding proxy (network_mode: host in the server's
+// docker-compose.yml, no change) -- none of those affected this specific
+// failure, pointing at the WiFi link itself needing more time per send
+// rather than a connection-freshness or transport-layer cause. Same
+// device-freeze risk tradeoff as the 200->1000 raise: a genuinely dead
+// connection now takes longer to detect via this path, but a real dead
+// connection is still caught by esp_websocket_client's own PING/PONG and
+// keepalive mechanisms independent of this value.
+#define SEND_TIMEOUT_MS 3000
 
 // server_client_send_hello() and server_client_send_camera_frame() below
 // are the two exceptions to SEND_TIMEOUT_MS -- but NOT the same bound as
@@ -194,6 +214,19 @@ static size_t s_audio_reassembly_total; // expected total, from payload_len
 #define MAX_SESSION_ID_LEN 64
 static char s_session_id[MAX_SESSION_ID_LEN];
 
+// -1 = never connected (or currently disconnected) -- see
+// server_client_ms_since_connected()'s doc comment in the header for why
+// this exists (camera_face_track.c's connection-warmup grace period).
+static int64_t s_connected_at_us = -1;
+
+int64_t server_client_ms_since_connected(void)
+{
+    if (s_connected_at_us < 0) {
+        return -1;
+    }
+    return (esp_timer_get_time() - s_connected_at_us) / 1000;
+}
+
 // Sends the protocol `hello` message. Public (not static): called from
 // main.c's orchestrator_task, in response to consuming a
 // SERVER_CLIENT_EVENT_CONNECTED off the event queue -- deliberately NOT
@@ -306,6 +339,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         // the next successful (re)connect posts CONNECTED again and gets
         // another chance.
         ESP_LOGI(TAG, "WebSocket connected (session=%s)", s_session_id);
+        s_connected_at_us = esp_timer_get_time();
         server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_CONNECTED };
         if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
             ESP_LOGW(TAG, "event queue full, dropping connected event");
@@ -313,6 +347,16 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
     }
     case WEBSOCKET_EVENT_DISCONNECTED: {
+        // Previously silent -- this case had no log line at all, so a
+        // fast disconnect/reconnect cycle (the underlying esp_websocket_
+        // client reconnecting before the next thing anyone looks at) was
+        // completely invisible on the serial console even though its
+        // side effect (orchestrator.c's ORCHESTRATOR_SERVER_EVENT_
+        // DISCONNECTED case flashing EXPR_ERROR) was visibly happening on
+        // real hardware -- found while chasing exactly that on real
+        // hardware.
+        ESP_LOGW(TAG, "WebSocket disconnected");
+        s_connected_at_us = -1;
         server_client_event_t evt = { .type = SERVER_CLIENT_EVENT_DISCONNECTED };
         if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
             ESP_LOGW(TAG, "event queue full, dropping disconnect event");
@@ -349,6 +393,30 @@ esp_err_t server_client_init(const char *url, const char *session_id, QueueHandl
         // unrelated to this config.)
         .network_timeout_ms = 9000,
         .reconnect_timeout_ms = 1000,
+        // TCP-level keepalive, off by default (keep_alive_enable defaults
+        // to false). Found on real hardware: a connection can go dead
+        // (NAT/port-forward path drops it, no FIN/RST reaches either
+        // side -- confirmed happening through Docker Desktop's own
+        // virtualized networking during this project's development,
+        // separately from the corporate-network case this file's other
+        // comments already document) while Haro sits idle waiting for a
+        // wake word, and this is only discovered on the NEXT real write
+        // -- the wake-word-triggered hello/interrupt send -- producing a
+        // visible red-LED "unreachable" blip exactly when the user
+        // speaks to it, before the automatic reconnect (already working
+        // correctly) catches up a few seconds later. Enabling TCP
+        // keepalive makes the OS itself probe the idle connection and
+        // detect a dead peer proactively, during the idle wait, not at
+        // the moment of the user's own turn. 5s idle before the first
+        // probe, a probe every 5s after that, dead after 3 unanswered
+        // probes -- so a truly dead connection is caught and reconnect
+        // begun within ~15-20s of going idle, comfortably before most
+        // wake-word gaps, without probing so aggressively it wastes
+        // power/airtime on a healthy connection.
+        .keep_alive_enable = true,
+        .keep_alive_idle = 5,
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3,
     };
     s_client = esp_websocket_client_init(&config);
     if (s_client == NULL) {

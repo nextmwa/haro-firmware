@@ -1,5 +1,8 @@
 #include "orchestrator.h"
+#include "esp_log.h"
 #include <string.h>
+
+static const char *TAG = "orchestrator";
 
 static orchestrator_ops_t s_ops;
 static haro_state_t s_state = HARO_STATE_IDLE;
@@ -98,6 +101,12 @@ void orchestrator_on_server_event(orchestrator_server_event_t event)
         } else if (event.protocol_event.type == PROTOCOL_EVENT_RESPONSE_END) {
             return_to_idle();
         } else if (event.protocol_event.type == PROTOCOL_EVENT_ERROR) {
+            // Previously silent -- added while chasing a brief red/EXPR_
+            // ERROR flash on real hardware that no log line explained;
+            // distinguishes a real server-sent protocol error from the
+            // DISCONNECTED case below, which looks the same on the
+            // display but comes from a dropped connection instead.
+            ESP_LOGW(TAG, "server sent PROTOCOL_EVENT_ERROR");
             s_ops.face.show(s_ops.face.ctx, EXPR_ERROR);
             return_to_idle();
         } else if (event.protocol_event.type == PROTOCOL_EVENT_ACTION) {
@@ -151,6 +160,8 @@ void orchestrator_on_server_event(orchestrator_server_event_t event)
         if (s_state == HARO_STATE_IDLE) {
             break;
         }
+        // Previously silent -- see PROTOCOL_EVENT_ERROR's comment above.
+        ESP_LOGW(TAG, "server connection dropped while in state %d -- forcing back to idle", (int)s_state);
         s_ops.face.show(s_ops.face.ctx, EXPR_ERROR);
         return_to_idle();
         break;

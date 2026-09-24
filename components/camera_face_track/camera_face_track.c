@@ -102,6 +102,48 @@ static const char *TAG = "camera_face_track";
 #define CAMERA_SEND_FAILURE_THRESHOLD 3
 #define CAMERA_SEND_RETRY_INTERVAL_MS 60000
 
+// Grace period after a (re)connect before the first camera-frame send is
+// even attempted. Kept even though it turned out NOT to be the real fix
+// (see s_camera_sending_enabled's comment below) -- still harmless and
+// still correct in spirit (don't send anything on a connection that
+// hasn't had a moment to settle).
+#define CAMERA_SEND_CONNECTION_WARMUP_MS 15000
+
+// Master switch for camera-frame sending, separate from
+// s_camera_sending_enabled below (that one is *runtime* auto-disable/
+// retry state for transient failures -- it must stay reachable and
+// still retry every CAMERA_SEND_RETRY_INTERVAL_MS when this master
+// switch is on). This one is a deliberate, compile-time feature
+// decision: 0 disables camera-frame sending unconditionally, with no
+// periodic retry, because retrying would just repeatedly re-trigger the
+// exact failure described below. Flip to 1 once that failure is
+// actually root-caused and fixed.
+#define CAMERA_FRAME_SENDING_FEATURE_ENABLED 0
+
+// Camera-frame sending is disabled by default. Found on real hardware:
+// a camera frame (base64-encoded JPEG wrapped in a JSON text message --
+// protocol_encode_camera_frame(), server_client_send_camera_frame() --
+// notably bigger than every other message this file's neighbors send:
+// hello is tiny, audio frames are small raw PCM chunks) reliably times
+// out at its own CAMERA_FRAME_SEND_TIMEOUT_MS bound (server_client.c),
+// killing the WebSocket connection outright (esp_transport_write()
+// returning 0, forced reconnect) -- confirmed NOT to be a "freshly
+// connected" issue: adding CAMERA_SEND_CONNECTION_WARMUP_MS above only
+// delayed the first failure by the same margin, and once sending
+// started it then failed again roughly every ~9s (CAMERA_FRAME_SEND_
+// TIMEOUT_MS's 8000ms plus ~1s of FACE_TRACK_POLL_MS/reconnect
+// overhead), on a clean, freshly-reconnected client every time -- i.e.
+// this isn't a warmup problem, camera-frame sending just doesn't
+// complete successfully on this hardware/network/server path at all,
+// and disrupts the actual voice interaction (wake word, hello, TTS
+// playback) every time it's attempted. Voice interaction is the
+// priority; face-tracking (servo eye-follow driven by these frames) is
+// secondary and not worth breaking voice for. Root cause not yet
+// investigated (candidates: the base64-JSON-over-text encoding vs a
+// smaller/binary representation, or something server-side struggling
+// with these specific messages) -- left disabled here until that
+// investigation happens, rather than shipping a "grace period" that
+// doesn't actually fix the underlying failure.
 static bool s_camera_sending_enabled = true;
 static int s_consecutive_send_failures = 0;
 static int64_t s_camera_sending_disabled_at_us = 0;
@@ -179,8 +221,19 @@ static void face_track_task(void *arg)
         // step, not just the send, while disabled and not yet due for a
         // retry: no reason to spend the camera/JPEG-encode work on a
         // frame this loop already knows it won't attempt to send.
-        bool attempt_send = s_camera_sending_enabled;
-        if (!attempt_send) {
+        // See CAMERA_SEND_CONNECTION_WARMUP_MS's comment: a freshly
+        // (re)connected client (< 0 means not connected at all right
+        // now, per server_client_ms_since_connected()'s own doc comment)
+        // never gets a frame attempt until the connection has had time
+        // to settle, regardless of s_camera_sending_enabled/retry state
+        // below -- this is a separate, unconditional gate, not part of
+        // the failure-count auto-disable logic (a not-yet-warmed-up
+        // connection isn't a "failure" to count).
+        int64_t ms_connected = server_client_ms_since_connected();
+        bool connection_warmed_up = ms_connected >= 0 && ms_connected >= CAMERA_SEND_CONNECTION_WARMUP_MS;
+
+        bool attempt_send = CAMERA_FRAME_SENDING_FEATURE_ENABLED && connection_warmed_up && s_camera_sending_enabled;
+        if (CAMERA_FRAME_SENDING_FEATURE_ENABLED && connection_warmed_up && !attempt_send) {
             int64_t now_us = esp_timer_get_time();
             if (now_us - s_camera_sending_disabled_at_us >= (int64_t)CAMERA_SEND_RETRY_INTERVAL_MS * 1000) {
                 attempt_send = true; // one retry attempt this cycle

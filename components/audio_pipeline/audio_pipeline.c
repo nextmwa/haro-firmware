@@ -118,6 +118,17 @@ static esp_err_t tca9555_enable_pa(void)
 static esp_err_t init_i2s(void)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    // Found on real hardware (2026-09-24): with the default auto_clear=false,
+    // whenever playback runs dry the TX DMA keeps re-sending whatever its
+    // descriptor ring last held (6 x 240 frames = ~90ms at 16kHz). TTS
+    // arrives from the server only ~1.1-1.2x faster than real time, sentence
+    // by sentence with ~300ms of prompting between them, so underruns are
+    // routine: mid-reply they replayed 90ms fragments (heard as "metallic"
+    // speech), and after the reply ended the stale ring looped forever as a
+    // quiet "tu-tu-tu-tu" -- the TX channel is never disabled here, since
+    // full-duplex RX shares its clock. auto_clear makes the DMA send zeros
+    // (silence) when there's nothing new to play.
+    chan_cfg.auto_clear = true;
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_handle, &s_rx_handle);
     if (err != ESP_OK) return err;
 

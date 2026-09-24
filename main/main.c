@@ -23,6 +23,13 @@ void app_main(void)
 #include "camera_face_track.h"
 #include "orchestrator.h"
 #include "freertos/idf_additions.h"
+#include "esp_wifi.h"
+#include "esp_timer.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/icmp.h"
+#include "lwip/inet_chksum.h"
+#include "lwip/prot/ip4.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_random.h"
@@ -245,6 +252,183 @@ static void persist_volume_level_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// KEY2 info screens: each press advances NONE -> NETWORK -> WAKE_WORDS ->
+// NONE (back to the eyes). While one is open it owns the display the same
+// way the volume icon does (eyes, idle fidgets, music notes and the
+// server-unreachable text all stand down), and a detected wake word closes
+// it so the conversation's own faces take over.
+typedef enum { INFO_SCREEN_NONE, INFO_SCREEN_NETWORK, INFO_SCREEN_WAKE_WORDS } info_screen_t;
+#define INFO_SCREEN_REDRAW_MS 1000
+
+// Shared by the KEY2 wake-word page and app_main()'s boot-time reminder --
+// keep in sync by hand with sdkconfig.defaults' CONFIG_SR_WN_* selection
+// and wake_word.c's esp_srmodel_filter() strings (see the reminder's
+// comment in app_main()).
+#define WAKE_WORD_1 "hey kira"
+#define WAKE_WORD_2 "hi wall e"
+
+// Network page data, gathered by net_info_task (below) rather than on
+// orchestrator_task: the ICMP ping blocks for up to NET_INFO_PING_TIMEOUT_MS
+// and a hostname server URL needs a blocking DNS lookup, neither of which
+// belongs in the main loop. The task only works while s_net_info_active is
+// set (the NETWORK page is open) and otherwise sleeps on a task
+// notification, so it costs nothing the rest of the time. Pings the Haro
+// server's host (s_server_host, from the configured server URL), not the
+// WiFi gateway -- that's the round-trip that actually matters for Haro.
+#define NET_INFO_PING_INTERVAL_MS 1000
+#define NET_INFO_PING_TIMEOUT_MS 1000
+#define NET_INFO_PING_ID 0x4852 // "HR", to pick our echo replies out of any other ICMP traffic
+
+typedef struct {
+    char ssid[33]; // empty = not associated with an AP
+    int rssi_dbm;
+    int ping_ms;   // -1 = no reply (timeout, unresolved host, no WiFi)
+} net_info_t;
+
+static char s_server_host[64];
+static volatile bool s_net_info_active;
+static net_info_t s_net_info = { .ping_ms = -1 };
+static portMUX_TYPE s_net_info_lock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_net_info_task;
+
+// RSSI to the 1-10 scale shown on the network page: -90 dBm or weaker = 1
+// (barely usable), -40 dBm or stronger = 10 (next to the AP), linear between.
+static int rssi_to_level(int rssi_dbm)
+{
+    if (rssi_dbm <= -90) {
+        return 1;
+    }
+    if (rssi_dbm >= -40) {
+        return 10;
+    }
+    return 1 + (rssi_dbm + 90) * 9 / 50;
+}
+
+static bool resolve_host(const char *host, struct sockaddr_in *out)
+{
+    if (inet_pton(AF_INET, host, &out->sin_addr) == 1) {
+        return true;
+    }
+    struct addrinfo hints = { .ai_family = AF_INET };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
+        return false;
+    }
+    out->sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return true;
+}
+
+// One ICMP echo request/reply over a raw socket; returns the round-trip in
+// ms, or -1 on timeout/error. Hand-rolled rather than ESP-IDF's esp_ping:
+// esp_ping spawns its own task with an internal-RAM stack, and internal RAM
+// is nearly exhausted by the time this runs (see orchestrator_task's
+// xTaskCreateWithCaps() comment in app_main()), whereas this runs on
+// net_info_task's PSRAM stack.
+static int ping_once_ms(const struct sockaddr_in *dst, uint16_t seq)
+{
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        return -1;
+    }
+    struct timeval tv = { .tv_sec = 0, .tv_usec = NET_INFO_PING_TIMEOUT_MS * 1000 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct icmp_echo_hdr req = { 0 };
+    ICMPH_TYPE_SET(&req, ICMP_ECHO);
+    ICMPH_CODE_SET(&req, 0);
+    req.id = htons(NET_INFO_PING_ID);
+    req.seqno = htons(seq);
+    req.chksum = inet_chksum(&req, sizeof(req));
+
+    int result = -1;
+    int64_t sent_at_us = esp_timer_get_time();
+    if (sendto(sock, &req, sizeof(req), 0, (const struct sockaddr *)dst, sizeof(*dst)) == sizeof(req)) {
+        uint8_t buf[64];
+        // Raw ICMP sockets see every inbound ICMP packet (lwIP includes the
+        // IP header), so skip anything that isn't the reply to this request.
+        while (esp_timer_get_time() - sent_at_us < NET_INFO_PING_TIMEOUT_MS * 1000LL) {
+            int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
+            if (n < 0) {
+                break; // SO_RCVTIMEO expired
+            }
+            int ip_hlen = IPH_HL((struct ip_hdr *)buf) * 4;
+            if (n < ip_hlen + (int)sizeof(struct icmp_echo_hdr)) {
+                continue;
+            }
+            const struct icmp_echo_hdr *reply = (const struct icmp_echo_hdr *)(buf + ip_hlen);
+            if (ICMPH_TYPE(reply) == ICMP_ER && reply->id == req.id && reply->seqno == req.seqno) {
+                result = (int)((esp_timer_get_time() - sent_at_us) / 1000);
+                break;
+            }
+        }
+    }
+    close(sock);
+    return result;
+}
+
+static void net_info_task(void *arg)
+{
+    struct sockaddr_in dst = { .sin_family = AF_INET };
+    bool resolved = false;
+    uint16_t seq = 0;
+    while (true) {
+        if (!s_net_info_active) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+        net_info_t info = { .ping_ms = -1 };
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            strlcpy(info.ssid, (const char *)ap.ssid, sizeof(info.ssid));
+            info.rssi_dbm = ap.rssi;
+            if (!resolved) {
+                resolved = resolve_host(s_server_host, &dst);
+            }
+            if (resolved) {
+                info.ping_ms = ping_once_ms(&dst, ++seq);
+            }
+        }
+        taskENTER_CRITICAL(&s_net_info_lock);
+        s_net_info = info;
+        taskEXIT_CRITICAL(&s_net_info_lock);
+        vTaskDelay(pdMS_TO_TICKS(NET_INFO_PING_INTERVAL_MS));
+    }
+}
+
+static void set_net_info_active(bool active)
+{
+    s_net_info_active = active;
+    if (!active) {
+        return;
+    }
+    if (s_net_info_task == NULL) {
+        // PSRAM stack for the same reason as orchestrator_task's (see its
+        // xTaskCreateWithCaps() call in app_main()). Created on the first
+        // KEY2 press, not at boot, so it costs nothing if never used.
+        if (xTaskCreateWithCaps(net_info_task, "net_info", 4096, NULL, tskIDLE_PRIORITY + 2,
+                                &s_net_info_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+            ESP_LOGW(TAG, "xTaskCreateWithCaps(net_info_task) failed -- network page will show stale/empty data");
+            s_net_info_task = NULL;
+            return;
+        }
+    }
+    xTaskNotifyGive(s_net_info_task);
+}
+
+static void draw_info_screen(info_screen_t screen)
+{
+    if (screen == INFO_SCREEN_NETWORK) {
+        taskENTER_CRITICAL(&s_net_info_lock);
+        net_info_t info = s_net_info;
+        taskEXIT_CRITICAL(&s_net_info_lock);
+        face_display_set_network_info(info.ssid, info.rssi_dbm, rssi_to_level(info.rssi_dbm), info.ping_ms);
+    } else if (screen == INFO_SCREEN_WAKE_WORDS) {
+        static const char *const lines[] = { "wake words:", "", WAKE_WORD_1, WAKE_WORD_2 };
+        face_display_set_text_lines(lines, sizeof(lines) / sizeof(lines[0]));
+    }
+}
+
 // Idle-animation timing, in milliseconds. Tunable; not exposed via Kconfig
 // since these are purely cosmetic defaults, not a hardware/protocol
 // constant. See the idle-animation block in orchestrator_task() below.
@@ -425,6 +609,8 @@ static void orchestrator_task(void *arg)
     audio_pipeline_set_volume_percent((int)volume_level * 10);
     TickType_t next_button_poll = 0;
     TickType_t volume_icon_until = 0; // 0 = icon not currently showing
+    info_screen_t info_screen = INFO_SCREEN_NONE;
+    TickType_t info_next_redraw = 0;
 
     while (true) {
         wake_word_event_type_t wake_evt;
@@ -442,6 +628,13 @@ static void orchestrator_task(void *arg)
                 // thrashing between the error screen and a dead-end
                 // LISTENING state).
             } else if (wake_evt == WAKE_WORD_DETECTED) {
+                // Close any KEY2 info screen -- orchestrator_on_wake_word()
+                // below paints LISTENING, and the info redraw would
+                // otherwise keep painting back over the conversation.
+                if (info_screen != INFO_SCREEN_NONE) {
+                    info_screen = INFO_SCREEN_NONE;
+                    set_net_info_active(false);
+                }
                 bool was_playing_music = (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC);
                 if (was_playing_music) {
                     // Flush whatever was still in flight for the
@@ -526,12 +719,27 @@ static void orchestrator_task(void *arg)
         TickType_t now = xTaskGetTickCount();
 
         // Volume buttons (KEY1/KEY3, buttons.c): KEY1 raises the level,
-        // KEY3 lowers it (KEY2 unused for now, per the current scope --
-        // buttons_poll() already reports it, nothing here reacts to it).
+        // KEY3 lowers it. KEY2 cycles the info screens (see info_screen_t).
         // Throttled to BUTTON_POLL_MS -- see that constant's comment.
         if (now >= next_button_poll) {
             button_id_t pressed;
-            if (buttons_poll(&pressed) && (pressed == BUTTON_KEY1 || pressed == BUTTON_KEY3)) {
+            bool got_press = buttons_poll(&pressed);
+            if (got_press && pressed == BUTTON_KEY2) {
+                info_screen = (info_screen == INFO_SCREEN_NONE)    ? INFO_SCREEN_NETWORK
+                            : (info_screen == INFO_SCREEN_NETWORK) ? INFO_SCREEN_WAKE_WORDS
+                                                                   : INFO_SCREEN_NONE;
+                set_net_info_active(info_screen == INFO_SCREEN_NETWORK);
+                volume_icon_until = 0; // KEY2 takes the screen right away
+                info_next_redraw = now;
+                if (info_screen == INFO_SCREEN_NONE && s_server_reachable &&
+                    orchestrator_get_state() != HARO_STATE_PLAYING_MUSIC) {
+                    // Back to the eyes immediately rather than at the next
+                    // blink: re-renders the current pose with the current
+                    // gaze overlay. (Music notes and the error text redraw
+                    // on their own within ~100ms, so nothing needed there.)
+                    face_display_set_gaze_offset(eye_last_px_dx, eye_last_px_dy);
+                }
+            } else if (got_press && (pressed == BUTTON_KEY1 || pressed == BUTTON_KEY3)) {
                 if (pressed == BUTTON_KEY1 && volume_level < 10) {
                     volume_level++;
                 } else if (pressed == BUTTON_KEY3 && volume_level > 1) {
@@ -583,8 +791,14 @@ static void orchestrator_task(void *arg)
         // over s_framebuffer). Face tracking also has nothing useful to
         // show while unreachable, since face detection is itself
         // server-side (no face_position events can arrive).
+        bool showing_info = (info_screen != INFO_SCREEN_NONE);
+        if (showing_info && !showing_volume_icon && now >= info_next_redraw) {
+            draw_info_screen(info_screen);
+            info_next_redraw = now + pdMS_TO_TICKS(INFO_SCREEN_REDRAW_MS);
+        }
+
         bool eyes_and_led_allowed = s_server_reachable && orchestrator_get_state() != HARO_STATE_PLAYING_MUSIC &&
-                                     !showing_volume_icon;
+                                     !showing_volume_icon && !showing_info;
         if (eyes_and_led_allowed) {
             if (now >= saccade_next_pick) {
                 int range = 2 * SACCADE_MAX_PX + 1;
@@ -654,7 +868,7 @@ static void orchestrator_task(void *arg)
         // Losing s_server_reachable resets this the same way any other
         // non-idle state already does (the `else` below), so idle fidgets
         // resume cleanly once reachable again.
-        if (orchestrator_get_state() == HARO_STATE_IDLE && s_server_reachable && !showing_volume_icon) {
+        if (orchestrator_get_state() == HARO_STATE_IDLE && s_server_reachable && !showing_volume_icon && !showing_info) {
             if (!was_idle) {
                 was_idle = true;
                 idle_since = now;
@@ -731,7 +945,7 @@ static void orchestrator_task(void *arg)
         // immediately, the exact "two blocks independently redrawing,
         // fighting over s_framebuffer" hazard the error-text block's own
         // comment already describes for a different pair of overlays.
-        if (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC && !showing_volume_icon) {
+        if (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC && !showing_volume_icon && !showing_info) {
             if (now >= music_next_update) {
                 music_scroll_offset += 3;
                 face_display_set_music_notes(music_scroll_offset);
@@ -753,7 +967,7 @@ static void orchestrator_task(void *arg)
         // redrawing overlay" reason as the music-notes block above -- a
         // volume adjustment while unreachable still gets its 4s of screen
         // time before the error text resumes.
-        if (!s_server_reachable && !showing_volume_icon) {
+        if (!s_server_reachable && !showing_volume_icon && !showing_info) {
             if (now >= error_next_update) {
                 error_scroll_offset += 2;
                 face_display_set_scrolling_text(s_server_error_text, error_scroll_offset);
@@ -953,6 +1167,12 @@ void app_main(void)
         host_port += 5;
     }
     snprintf(s_server_error_text, sizeof(s_server_error_text), "server non raggiungibile   %s   ", host_port);
+    // Host only (no ":port"), for the KEY2 network page's ping.
+    strlcpy(s_server_host, host_port, sizeof(s_server_host));
+    char *port_sep = strchr(s_server_host, ':');
+    if (port_sep != NULL) {
+        *port_sep = '\0';
+    }
 
     s_wake_queue = xQueueCreate(4, sizeof(wake_word_event_type_t));
     // Depth 32 (was 8): confirmed on real hardware that 8 was too shallow
@@ -1004,14 +1224,15 @@ void app_main(void)
     // task's own loop, which has to coexist with everything else that
     // touches the display -- see that call site's gating).
     //
-    // The text is a plain literal, not derived from wake_word.c's loaded
-    // model names (those are internal identifiers like "wn9_heykira_
-    // tts3", not display-friendly) -- keep it in sync by hand alongside
+    // Built from the WAKE_WORD_1/WAKE_WORD_2 literals (shared with the
+    // KEY2 wake-word page), not derived from wake_word.c's loaded model
+    // names (those are internal identifiers like "wn9_heykira_tts3", not
+    // display-friendly) -- keep them in sync by hand alongside
     // sdkconfig.defaults' CONFIG_SR_WN_* selection and wake_word.c's
     // esp_srmodel_filter() strings whenever the pairing changes again.
     #define WAKE_WORD_REMINDER_MS 10000
     {
-        const char *reminder_text = "wake words are hey kira and hi wall e   ";
+        const char *reminder_text = "wake words are " WAKE_WORD_1 " and " WAKE_WORD_2 "   ";
         TickType_t reminder_until = xTaskGetTickCount() + pdMS_TO_TICKS(WAKE_WORD_REMINDER_MS);
         int reminder_scroll_offset = 0;
         while (xTaskGetTickCount() < reminder_until) {

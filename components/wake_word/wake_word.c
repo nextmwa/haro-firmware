@@ -294,6 +294,25 @@ static void feed_task(void *arg)
 // grace window elapses.
 #define WAKE_WORD_GRACE_MS 500
 
+// Reported on real hardware (2026-09-24): with other people talking in the
+// room, VAD correctly keeps reporting VAD_SPEECH after the user has
+// finished -- it detects *a* voice, not *the user's* -- so listening only
+// ended at main.c's MAX_LISTEN_MS failsafe, with the other voices forwarded
+// to STT too. The user speaks right next to the device and is much louder
+// than anyone across the room, so a frame whose volume (AFE's own
+// afe_fetch_result_t.data_volume, dB, computed before AGC -- free, no extra
+// RAM or CPU) sits more than SPEECH_END_VOLUME_DROP_DB below the loudest
+// level reached so far in this command also counts as "silence" toward
+// SPEECH_END_SILENCE_MS, even while VAD still says VAD_SPEECH.
+// Calibrated on real hardware (2026-09-24): the user's own speech measured
+// -23..-31 dB (smoothed) close to the device, everything after they
+// stopped -37..-58 dB while VAD still reported VAD_SPEECH -- 12dB keeps the
+// user's natural level swings (~8dB) well clear of the threshold.
+#define SPEECH_END_VOLUME_DROP_DB 12.0f
+// Smoothing for data_volume (one value per ~32ms fetch) so a single quiet
+// frame between syllables doesn't read as a drop.
+#define SPEECH_END_VOLUME_SMOOTHING 0.3f
+
 static void detect_task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
@@ -314,6 +333,11 @@ static void detect_task(void *arg)
     // frame resets this (see the vad_state == VAD_SPEECH branch below).
     bool in_silence = false;
     int64_t silence_start_us = 0;
+    // See SPEECH_END_VOLUME_DROP_DB: smoothed per-fetch volume, and the
+    // loudest smoothed volume seen during this command's VAD_SPEECH frames
+    // (taken as the user's own speaking level).
+    float smoothed_volume_db = -100.0f;
+    float speech_level_db = -100.0f;
 
     while (true) {
         afe_fetch_result_t *res = s_afe_handle->fetch(afe_data);
@@ -336,7 +360,10 @@ static void detect_task(void *arg)
             seen_speech = false;
             in_silence = false;
             wake_detected_us = esp_timer_get_time();
+            speech_level_db = -100.0f;
         }
+
+        smoothed_volume_db += SPEECH_END_VOLUME_SMOOTHING * (res->data_volume - smoothed_volume_db);
 
         if (awaiting_speech_end && (esp_timer_get_time() - wake_detected_us) < (int64_t)WAKE_WORD_GRACE_MS * 1000) {
             // Still inside the post-wake-word grace window -- ignore
@@ -344,10 +371,16 @@ static void detect_task(void *arg)
             // wake phrase's own trailing audio must not arm seen_speech,
             // and a pause here must not start a silence run either.
         } else if (awaiting_speech_end) {
-            if (res->vad_state == VAD_SPEECH) {
+            // Far quieter than the user's own level: background voices
+            // (see SPEECH_END_VOLUME_DROP_DB), treated like VAD_SILENCE.
+            bool far_below_user = seen_speech && smoothed_volume_db < speech_level_db - SPEECH_END_VOLUME_DROP_DB;
+            if (res->vad_state == VAD_SPEECH && !far_below_user) {
                 seen_speech = true;
                 in_silence = false;
-            } else if (res->vad_state == VAD_SILENCE && seen_speech) {
+                if (smoothed_volume_db > speech_level_db) {
+                    speech_level_db = smoothed_volume_db;
+                }
+            } else if (seen_speech) {
                 int64_t now_us = esp_timer_get_time();
                 if (!in_silence) {
                     in_silence = true;

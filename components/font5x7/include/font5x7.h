@@ -5,10 +5,11 @@
 extern "C" {
 #endif
 
-// Minimal 5x7 bitmap font: only the glyphs face_display's error screen
-// actually needs (lowercase letters in "server non raggiungibile", digits,
-// space, '.', ':' for an "ip:port" string) -- not a general-purpose ASCII
-// font. Deliberately its own component, separate from face_display: it has
+// Minimal 5x7 bitmap font: lowercase a-z (uppercase A-Z folds onto the
+// same glyphs), digits, space and a handful of punctuation (. : - _ /) --
+// what face_display's text screens (server-unreachable error, wake-word
+// reminder, KEY2 network-info/wake-word screens) need, not a
+// general-purpose ASCII font. Deliberately its own component, separate from face_display: it has
 // no ESP-IDF hardware dependency (no esp_lcd/i2c includes), so it builds
 // and is testable on the "linux" host target even though the rest of
 // face_display isn't (see this component's CMakeLists.txt and test/).
