@@ -70,6 +70,14 @@ esp_err_t server_client_send_camera_frame(const uint8_t *jpeg, size_t jpeg_len);
 // frames specifically.
 int64_t server_client_ms_since_connected(void);
 
+// Where incoming binary WebSocket data (the server's audio stream) goes.
+// When set, audio bypasses the event queue entirely: each received
+// fragment is handed to `sink` in order, straight from the WebSocket task
+// -- no reassembly malloc and no SERVER_CLIENT_EVENT_AUDIO per chunk (see
+// audio_player.h for why the queue path broke down). `sink` must not
+// block. Set before server_client_init().
+void server_client_set_audio_sink(void (*sink)(const uint8_t *data, size_t len));
+
 #ifdef __cplusplus
 }
 #endif

@@ -22,6 +22,7 @@ void app_main(void)
 #include "servo.h"
 #include "camera_face_track.h"
 #include "orchestrator.h"
+#include "audio_player.h"
 #include "freertos/idf_additions.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
@@ -131,11 +132,9 @@ static void audio_play_chunk(void *ctx, const uint8_t *data, size_t len)
 
 static void audio_stop(void *ctx)
 {
-    esp_err_t err = audio_pipeline_stop_playback();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "audio_pipeline_stop_playback failed: %s -- residual audio may keep playing briefly",
-                 esp_err_to_name(err));
-    }
+    // The playback task owns the codec (see audio_player.h): it discards
+    // whatever is still buffered and closes/reopens the codec itself.
+    audio_player_stop();
 }
 
 static void face_show(void *ctx, int expression)
@@ -194,6 +193,15 @@ static orchestrator_server_event_t to_orchestrator_event(const server_client_eve
 // this long in LISTENING, force the turn to end with whatever audio has
 // been captured so far, same as a real detected silence would.
 #define MAX_LISTEN_MS 12000
+
+// Follow-up listening (2026-09-24): after a spoken reply finishes, Haro keeps
+// listening this long for the user to answer without the wake word. Only
+// close, sustained speech opens a turn -- see wake_word_arm_follow_up().
+#define FOLLOW_UP_WINDOW_MS 2000
+// Mic frames kept while the window is open (~32ms each, so ~0.5s): the
+// speech detector needs ~150ms+ of speech before it fires, and these frames
+// are sent first so the start of what the user said isn't lost.
+#define FOLLOW_UP_PREROLL_FRAMES 16
 
 // Safety cap on HARO_STATE_THINKING/HARO_STATE_SPEAKING: unlike LISTENING
 // above (which MAX_LISTEN_MS covers) and PLAYING_MUSIC (escapable by a
@@ -612,7 +620,54 @@ static void orchestrator_task(void *arg)
     info_screen_t info_screen = INFO_SCREEN_NONE;
     TickType_t info_next_redraw = 0;
 
+    // A response_end that arrived while the audio before it was still
+    // playing from audio_player's buffer -- delivered once playback drains,
+    // so the orchestrator's return to idle doesn't cut the reply short.
+    bool response_end_pending = false;
+    server_client_event_t pending_response_end;
+    bool follow_up_active = false;
+    wake_word_audio_frame_t preroll[FOLLOW_UP_PREROLL_FRAMES];
+    int preroll_count = 0, preroll_head = 0; // ring: oldest at preroll_head
+
+    // Clears the follow-up window's pre-roll, freeing its frames.
+    #define PREROLL_CLEAR() do { \
+        for (int i_ = 0; i_ < preroll_count; i_++) free(preroll[(preroll_head + i_) % FOLLOW_UP_PREROLL_FRAMES].data); \
+        preroll_count = 0; preroll_head = 0; } while (0)
+
+    // Delivers a server event to the orchestrator; a reply that ends
+    // normally (SPEAKING -> IDLE on response_end) opens the follow-up window.
+    #define DELIVER_SERVER_EVENT(evt_ptr) do { \
+        haro_state_t before_ = orchestrator_get_state(); \
+        orchestrator_on_server_event(to_orchestrator_event(evt_ptr)); \
+        if (before_ == HARO_STATE_SPEAKING && orchestrator_get_state() == HARO_STATE_IDLE && \
+            (evt_ptr)->type == SERVER_CLIENT_EVENT_PROTOCOL && \
+            (evt_ptr)->protocol_event.type == PROTOCOL_EVENT_RESPONSE_END) { \
+            follow_up_active = true; \
+            wake_word_arm_follow_up(FOLLOW_UP_WINDOW_MS); \
+            face_display_show(EXPR_LISTENING); \
+        } } while (0)
+
     while (true) {
+        {
+            haro_state_t state = orchestrator_get_state();
+            bool expects_audio = state == HARO_STATE_THINKING || state == HARO_STATE_SPEAKING ||
+                                 state == HARO_STATE_PLAYING_MUSIC;
+            audio_player_set_accepting(expects_audio);
+            if (follow_up_active && state != HARO_STATE_IDLE) {
+                follow_up_active = false;
+                wake_word_cancel_follow_up();
+                PREROLL_CLEAR();
+            }
+            if (response_end_pending && audio_player_is_idle()) {
+                response_end_pending = false;
+                DELIVER_SERVER_EVENT(&pending_response_end);
+            } else if (!audio_player_is_idle() &&
+                       (state == HARO_STATE_THINKING || state == HARO_STATE_SPEAKING)) {
+                // Audio still playing is progress, same as a received event
+                // -- see MAX_THINKING_SPEAKING_MS.
+                thinking_or_speaking_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(MAX_THINKING_SPEAKING_MS);
+            }
+        }
         wake_word_event_type_t wake_evt;
         while (xQueueReceive(s_wake_queue, &wake_evt, 0) == pdTRUE) {
             if (wake_evt == WAKE_WORD_DETECTED && !s_server_reachable) {
@@ -628,6 +683,10 @@ static void orchestrator_task(void *arg)
                 // thrashing between the error screen and a dead-end
                 // LISTENING state).
             } else if (wake_evt == WAKE_WORD_DETECTED) {
+                if (follow_up_active) {
+                    follow_up_active = false; // wake_word already disarmed the window itself
+                    PREROLL_CLEAR();
+                }
                 // Close any KEY2 info screen -- orchestrator_on_wake_word()
                 // below paints LISTENING, and the info redraw would
                 // otherwise keep painting back over the conversation.
@@ -635,7 +694,10 @@ static void orchestrator_task(void *arg)
                     info_screen = INFO_SCREEN_NONE;
                     set_net_info_active(false);
                 }
-                bool was_playing_music = (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC);
+                // Speech (a long reply, an alarm) is interruptible now too
+                // -- same stale-audio flush and mic hold as music.
+                bool was_playing_music = (orchestrator_get_state() == HARO_STATE_PLAYING_MUSIC ||
+                                          orchestrator_get_state() == HARO_STATE_SPEAKING);
                 if (was_playing_music) {
                     // Flush whatever was still in flight for the
                     // interrupted track -- stale audio chunks/protocol
@@ -670,6 +732,29 @@ static void orchestrator_task(void *arg)
                 }
             } else if (wake_evt == WAKE_WORD_SPEECH_END) {
                 pending_speech_end = true;
+            } else if (wake_evt == WAKE_WORD_FOLLOW_UP_SPEECH) {
+                if (follow_up_active && orchestrator_get_state() == HARO_STATE_IDLE) {
+                    follow_up_active = false;
+                    orchestrator_on_wake_word(); // IDLE -> LISTENING, same as a wake word
+                    pending_speech_end = false;
+                    // The pre-roll first, oldest to newest: the start of
+                    // what the user said, from before detection fired.
+                    for (int i = 0; i < preroll_count; i++) {
+                        wake_word_audio_frame_t *f = &preroll[(preroll_head + i) % FOLLOW_UP_PREROLL_FRAMES];
+                        orchestrator_on_audio_frame(f->data, f->len, false);
+                        free(f->data);
+                    }
+                    preroll_count = 0;
+                    preroll_head = 0;
+                }
+            } else if (wake_evt == WAKE_WORD_FOLLOW_UP_TIMEOUT) {
+                if (follow_up_active) {
+                    follow_up_active = false;
+                    PREROLL_CLEAR();
+                    if (orchestrator_get_state() == HARO_STATE_IDLE) {
+                        face_display_show(EXPR_IDLE);
+                    }
+                }
             }
         }
 
@@ -683,7 +768,7 @@ static void orchestrator_task(void *arg)
         // mic here ourselves.
         bool listening = (orchestrator_get_state() == HARO_STATE_LISTENING) &&
                           xTaskGetTickCount() >= forwarding_hold_until;
-        wake_word_set_audio_forwarding(listening);
+        wake_word_set_audio_forwarding(listening || follow_up_active);
 
         // MAX_LISTEN_MS failsafe: track when LISTENING started, and force
         // speech-end once we've been in it too long -- see that constant's
@@ -1021,9 +1106,18 @@ static void orchestrator_task(void *arg)
                 if (hello_err != ESP_OK) {
                     ESP_LOGW(TAG, "failed to send hello: %s", esp_err_to_name(hello_err));
                 }
+            } else if (server_evt.type == SERVER_CLIENT_EVENT_PROTOCOL &&
+                       server_evt.protocol_event.type == PROTOCOL_EVENT_RESPONSE_END &&
+                       !audio_player_is_idle()) {
+                s_server_reachable = true;
+                pending_response_end = server_evt;
+                response_end_pending = true;
             } else {
                 s_server_reachable = (server_evt.type != SERVER_CLIENT_EVENT_DISCONNECTED);
-                orchestrator_on_server_event(to_orchestrator_event(&server_evt));
+                if (server_evt.type == SERVER_CLIENT_EVENT_DISCONNECTED) {
+                    response_end_pending = false;
+                }
+                DELIVER_SERVER_EVENT(&server_evt);
                 // Refresh the MAX_THINKING_SPEAKING_MS deadline on every
                 // event actually processed while the result is THINKING or
                 // SPEAKING -- see that constant's comment above for why
@@ -1080,6 +1174,16 @@ static void orchestrator_task(void *arg)
                 if (state_after_frame == HARO_STATE_THINKING || state_after_frame == HARO_STATE_SPEAKING) {
                     thinking_or_speaking_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(MAX_THINKING_SPEAKING_MS);
                 }
+            } else if (follow_up_active) {
+                // Kept, not sent: becomes the pre-roll if the user answers.
+                if (preroll_count == FOLLOW_UP_PREROLL_FRAMES) {
+                    free(preroll[preroll_head].data);
+                    preroll_head = (preroll_head + 1) % FOLLOW_UP_PREROLL_FRAMES;
+                    preroll_count--;
+                }
+                preroll[(preroll_head + preroll_count) % FOLLOW_UP_PREROLL_FRAMES] = frame;
+                preroll_count++;
+                continue; // ownership moved into the ring -- don't free
             }
             free(frame.data);
         }
@@ -1200,6 +1304,8 @@ void app_main(void)
     // be a synchronous server_client_send_hello() call right here, which was
     // guaranteed to fail on every boot since the WebSocket cannot possibly
     // be connected yet at this point).
+    ESP_ERROR_CHECK(audio_player_start());
+    server_client_set_audio_sink(audio_player_write);
     ESP_ERROR_CHECK(server_client_init(server_url, "haro-session", s_server_queue));
     ESP_ERROR_CHECK(wake_word_start(s_wake_queue, s_audio_frame_queue));
 

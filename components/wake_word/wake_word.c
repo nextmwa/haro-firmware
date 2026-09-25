@@ -313,6 +313,28 @@ static void feed_task(void *arg)
 // frame between syllables doesn't read as a drop.
 #define SPEECH_END_VOLUME_SMOOTHING 0.3f
 
+// Follow-up window (wake_word_arm_follow_up()): what counts as the user
+// answering. Absolute level, since there's no "user level" yet in a new
+// turn -- measured on real hardware (2026-09-24): the user speaking near
+// the device read -23..-31 dB (smoothed), background noise and other people
+// in the room -37..-58 dB. Plus a minimum duration, so a cough, a click or
+// a single loud word from across the room doesn't start a turn.
+#define FOLLOW_UP_MIN_VOLUME_DB -33.0f
+#define FOLLOW_UP_MIN_SPEECH_MS 150
+
+// 0 = no follow-up window open; otherwise its deadline (esp_timer us).
+static _Atomic int64_t s_follow_up_deadline_us;
+
+void wake_word_arm_follow_up(uint32_t window_ms)
+{
+    s_follow_up_deadline_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
+}
+
+void wake_word_cancel_follow_up(void)
+{
+    s_follow_up_deadline_us = 0;
+}
+
 static void detect_task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
@@ -338,6 +360,8 @@ static void detect_task(void *arg)
     // (taken as the user's own speaking level).
     float smoothed_volume_db = -100.0f;
     float speech_level_db = -100.0f;
+    // Start of the current run of near-field speech in a follow-up window.
+    int64_t follow_up_speech_since_us = 0;
 
     while (true) {
         afe_fetch_result_t *res = s_afe_handle->fetch(afe_data);
@@ -361,9 +385,46 @@ static void detect_task(void *arg)
             in_silence = false;
             wake_detected_us = esp_timer_get_time();
             speech_level_db = -100.0f;
+            s_follow_up_deadline_us = 0; // a real wake word supersedes a follow-up window
         }
 
         smoothed_volume_db += SPEECH_END_VOLUME_SMOOTHING * (res->data_volume - smoothed_volume_db);
+
+        int64_t follow_up_deadline = s_follow_up_deadline_us;
+        if (follow_up_deadline != 0 && !awaiting_speech_end) {
+            int64_t now_us = esp_timer_get_time();
+            bool near_speech = res->vad_state == VAD_SPEECH && smoothed_volume_db >= FOLLOW_UP_MIN_VOLUME_DB;
+            if (!near_speech) {
+                follow_up_speech_since_us = 0;
+            } else if (follow_up_speech_since_us == 0) {
+                follow_up_speech_since_us = now_us;
+            }
+            wake_word_event_type_t evt;
+            bool post = false;
+            if (follow_up_speech_since_us != 0 &&
+                now_us - follow_up_speech_since_us >= (int64_t)FOLLOW_UP_MIN_SPEECH_MS * 1000) {
+                ESP_LOGI(TAG, "follow-up speech detected (%.1f dB)", smoothed_volume_db);
+                evt = WAKE_WORD_FOLLOW_UP_SPEECH;
+                post = true;
+                // Same state as right after a wake word, minus the grace
+                // window: the user is already mid-sentence.
+                awaiting_speech_end = true;
+                seen_speech = true;
+                in_silence = false;
+                wake_detected_us = now_us - (int64_t)WAKE_WORD_GRACE_MS * 1000;
+                speech_level_db = smoothed_volume_db;
+            } else if (now_us >= follow_up_deadline) {
+                evt = WAKE_WORD_FOLLOW_UP_TIMEOUT;
+                post = true;
+            }
+            if (post) {
+                s_follow_up_deadline_us = 0;
+                follow_up_speech_since_us = 0;
+                if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "event_queue full, dropped follow-up event %d", (int)evt);
+                }
+            }
+        }
 
         if (awaiting_speech_end && (esp_timer_get_time() - wake_detected_us) < (int64_t)WAKE_WORD_GRACE_MS * 1000) {
             // Still inside the post-wake-word grace window -- ignore

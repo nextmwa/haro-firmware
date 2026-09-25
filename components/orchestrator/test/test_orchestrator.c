@@ -430,6 +430,37 @@ TEST_CASE("wake word is ignored while not IDLE", "[orchestrator]")
     TEST_ASSERT_EQUAL(1, s_shown_count);
 }
 
+TEST_CASE("a wake word while SPEAKING stops audio, sends interrupt, and starts LISTENING", "[orchestrator]")
+{
+    // Barge-in: "Hey Kira, stop" over a ringing alarm or a long reply.
+    orchestrator_init(make_fake_ops());
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
+    evt.protocol_event.type = PROTOCOL_EVENT_EMOTION;
+    strcpy(evt.protocol_event.value, "neutral");
+    orchestrator_on_server_event(evt);
+    TEST_ASSERT_EQUAL(HARO_STATE_SPEAKING, orchestrator_get_state());
+
+    orchestrator_on_wake_word();
+
+    TEST_ASSERT_EQUAL(HARO_STATE_LISTENING, orchestrator_get_state());
+    TEST_ASSERT_EQUAL(1, s_stop_calls);
+    TEST_ASSERT_EQUAL(1, s_interrupt_calls);
+}
+
+TEST_CASE("a wake word while THINKING is still ignored", "[orchestrator]")
+{
+    orchestrator_init(make_fake_ops());
+    orchestrator_on_wake_word();
+    uint8_t frame[] = { 1 };
+    orchestrator_on_audio_frame(frame, sizeof(frame), true);
+    TEST_ASSERT_EQUAL(HARO_STATE_THINKING, orchestrator_get_state());
+
+    orchestrator_on_wake_word();
+
+    TEST_ASSERT_EQUAL(HARO_STATE_THINKING, orchestrator_get_state());
+    TEST_ASSERT_EQUAL(0, s_interrupt_calls);
+}
+
 TEST_CASE("audio frames are ignored while IDLE", "[orchestrator]")
 {
     orchestrator_init(make_fake_ops());
@@ -439,8 +470,10 @@ TEST_CASE("audio frames are ignored while IDLE", "[orchestrator]")
     TEST_ASSERT_EQUAL(HARO_STATE_IDLE, orchestrator_get_state());
 }
 
-TEST_CASE("server events other than disconnect are ignored while IDLE", "[orchestrator]")
+TEST_CASE("an emotion while IDLE starts a proactive announcement", "[orchestrator]")
 {
+    // The server speaking on its own (calendar announcement, alarm) opens
+    // with an emotion event, exactly like a normal reply does.
     orchestrator_init(make_fake_ops());
 
     orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
@@ -448,6 +481,50 @@ TEST_CASE("server events other than disconnect are ignored while IDLE", "[orches
     strcpy(evt.protocol_event.value, "happy");
     orchestrator_on_server_event(evt);
 
+    TEST_ASSERT_EQUAL(HARO_STATE_SPEAKING, orchestrator_get_state());
+    TEST_ASSERT_EQUAL(1, s_shown_count);
+    TEST_ASSERT_EQUAL(3 /* EXPR_SPEAKING_HAPPY */, s_shown_expressions[0]);
+}
+
+TEST_CASE("a proactive announcement returns to IDLE on response_end", "[orchestrator]")
+{
+    orchestrator_init(make_fake_ops());
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
+    evt.protocol_event.type = PROTOCOL_EVENT_EMOTION;
+    strcpy(evt.protocol_event.value, "neutral");
+    orchestrator_on_server_event(evt);
+
+    evt.protocol_event.type = PROTOCOL_EVENT_RESPONSE_END;
+    orchestrator_on_server_event(evt);
+
+    TEST_ASSERT_EQUAL(HARO_STATE_IDLE, orchestrator_get_state());
+}
+
+TEST_CASE("server events other than emotion and disconnect are ignored while IDLE", "[orchestrator]")
+{
+    orchestrator_init(make_fake_ops());
+
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
+    evt.protocol_event.type = PROTOCOL_EVENT_RESPONSE_END;
+    orchestrator_on_server_event(evt);
+    evt.protocol_event.type = PROTOCOL_EVENT_ERROR;
+    orchestrator_on_server_event(evt);
+
     TEST_ASSERT_EQUAL(HARO_STATE_IDLE, orchestrator_get_state());
     TEST_ASSERT_EQUAL(0, s_shown_count);
+}
+
+TEST_CASE("an emotion while LISTENING does not interrupt the user's turn", "[orchestrator]")
+{
+    orchestrator_init(make_fake_ops());
+    orchestrator_on_wake_word();
+    int shown_before = s_shown_count;
+
+    orchestrator_server_event_t evt = { .type = ORCHESTRATOR_SERVER_EVENT_PROTOCOL };
+    evt.protocol_event.type = PROTOCOL_EVENT_EMOTION;
+    strcpy(evt.protocol_event.value, "happy");
+    orchestrator_on_server_event(evt);
+
+    TEST_ASSERT_EQUAL(HARO_STATE_LISTENING, orchestrator_get_state());
+    TEST_ASSERT_EQUAL(shown_before, s_shown_count);
 }

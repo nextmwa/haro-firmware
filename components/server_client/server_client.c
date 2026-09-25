@@ -45,6 +45,13 @@
 #include <stdlib.h>
 
 static const char *TAG = "server_client";
+
+static void (*s_audio_sink)(const uint8_t *data, size_t len);
+
+void server_client_set_audio_sink(void (*sink)(const uint8_t *data, size_t len))
+{
+    s_audio_sink = sink;
+}
 static esp_websocket_client_handle_t s_client;
 static QueueHandle_t s_event_queue;
 
@@ -267,7 +274,9 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         if (data->data_len <= 0) {
             break;
         }
-        if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) { // binary: TTS audio chunk (possibly fragmented -- see comment above)
+        if (data->op_code == WS_TRANSPORT_OPCODES_BINARY && s_audio_sink != NULL) {
+            s_audio_sink((const uint8_t *)data->data_ptr, (size_t)data->data_len);
+        } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) { // binary: TTS audio chunk (possibly fragmented -- see comment above)
             if (data->payload_offset == 0) {
                 // Start of a new logical message. Free any previous
                 // reassembly buffer first -- normally NULL already (the

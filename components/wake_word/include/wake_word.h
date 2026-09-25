@@ -23,6 +23,13 @@ typedef enum {
     // enabled below), so duplicating that work elsewhere would just be a
     // second, less accurate VAD running over the same audio.
     WAKE_WORD_SPEECH_END,
+    // Follow-up window (wake_word_arm_follow_up()): near-field speech was
+    // detected, so the user is answering without repeating the wake word.
+    // From here it behaves exactly like after WAKE_WORD_DETECTED --
+    // WAKE_WORD_SPEECH_END follows when they stop talking.
+    WAKE_WORD_FOLLOW_UP_SPEECH,
+    // The follow-up window elapsed with no near-field speech.
+    WAKE_WORD_FOLLOW_UP_TIMEOUT,
 } wake_word_event_type_t;
 
 // One raw mic frame, as read by wake_word's feed_task -- the SAME bytes fed
@@ -53,6 +60,15 @@ typedef struct {
 // server-audio-forwarding path during HARO_STATE_LISTENING) must go through
 // this queue rather than reading audio_pipeline directly.
 esp_err_t wake_word_start(QueueHandle_t event_queue, QueueHandle_t audio_frame_queue);
+
+// Opens a window of `window_ms` in which the user can keep talking without
+// the wake word (right after Haro finished a reply). Only close, sustained
+// speech counts -- VAD speech at a near-field volume for a minimum time --
+// so background noise and people talking across the room don't open a new
+// turn. Posts WAKE_WORD_FOLLOW_UP_SPEECH or WAKE_WORD_FOLLOW_UP_TIMEOUT.
+// A real wake word during the window cancels it.
+void wake_word_arm_follow_up(uint32_t window_ms);
+void wake_word_cancel_follow_up(void);
 
 // Arms/disarms production of wake_word_audio_frame_t values onto
 // `audio_frame_queue` (see wake_word_start). Safe to call from any task;

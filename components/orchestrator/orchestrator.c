@@ -36,11 +36,12 @@ haro_state_t orchestrator_get_state(void)
 
 void orchestrator_on_wake_word(void)
 {
-    if (s_state == HARO_STATE_PLAYING_MUSIC) {
-        // Interrupting music: stop local playback immediately and tell the
-        // server to stop streaming more of the track, then fall through to
-        // the normal "start listening" transition below -- unlike every
-        // other non-IDLE state, this one doesn't just ignore a wake word.
+    if (s_state == HARO_STATE_PLAYING_MUSIC || s_state == HARO_STATE_SPEAKING) {
+        // Interrupting audio Haro is playing -- music, or speech (a long
+        // reply, a ringing alarm: "Hey Kira, stop"): stop local playback
+        // immediately and tell the server to stop streaming, then fall
+        // through to the normal "start listening" transition below.
+        // LISTENING/THINKING still ignore a wake word.
         s_ops.audio_out.stop(s_ops.audio_out.ctx);
         if (s_ops.server.send_interrupt) {
             s_ops.server.send_interrupt(s_ops.server.ctx);
@@ -89,7 +90,18 @@ static void return_to_idle(void)
 
 void orchestrator_on_server_event(orchestrator_server_event_t event)
 {
-    if (s_state != HARO_STATE_THINKING && s_state != HARO_STATE_SPEAKING && s_state != HARO_STATE_PLAYING_MUSIC) {
+    // The server speaking on its own initiative (calendar announcement,
+    // alarm -- session.py's speak_announcement()) opens with an emotion
+    // event while Haro is IDLE, just like a reply does after THINKING.
+    // Until 2026-09-24 it was dropped below with every other IDLE event
+    // (found by reading this code while adding alarms), so proactive
+    // announcements could never be heard. Only from IDLE: never over the
+    // user's own LISTENING turn.
+    bool proactive_start = s_state == HARO_STATE_IDLE &&
+                           event.type == ORCHESTRATOR_SERVER_EVENT_PROTOCOL &&
+                           event.protocol_event.type == PROTOCOL_EVENT_EMOTION;
+    if (s_state != HARO_STATE_THINKING && s_state != HARO_STATE_SPEAKING && s_state != HARO_STATE_PLAYING_MUSIC &&
+        !proactive_start) {
         if (event.type != ORCHESTRATOR_SERVER_EVENT_DISCONNECTED) return;
     }
 

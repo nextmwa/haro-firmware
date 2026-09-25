@@ -116,3 +116,15 @@ CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
 # esp_websocket_client aborted the connection. RSSI was a healthy -65..-68
 # dBm throughout; this was never a WiFi signal problem.
 CONFIG_CAMERA_PSRAM_DMA=y
+
+# Plain malloc() of more than 1KB goes to PSRAM, not internal RAM (IDF
+# default: 16KB). Found on real hardware (2026-09-24): re-enabling camera
+# frames, the base64-JSON frame string (~9.5KB) was allocated in internal
+# RAM, dropping it to a 252-byte minimum with the largest free block at
+# 1344 bytes -- below the 1630-byte WiFi TX buffer -- so frame sends stalled
+# for 35s and the server dropped the connection (the same starvation
+# CONFIG_CAMERA_PSRAM_DMA above fixed for audio). Streamed TTS audio chunks
+# (~2.5KB each, up to ~1s queued) were headed for the same problem.
+# Drivers that need DMA/internal memory request it with explicit caps, so
+# they're unaffected.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024

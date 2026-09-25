@@ -8,7 +8,6 @@
 #include "audio_pipeline.h"
 #include "server_client.h"
 #include "esp_camera.h"
-#include "img_converters.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -73,7 +72,12 @@ static const char *TAG = "camera_face_track";
 // on top of the bounded-not-unbounded fix already in server_client.c;
 // 1000ms is still well under FACE_TRACK_STALE_MS below, so a lost frame
 // doesn't read as "no face" on its own.
-#define FACE_TRACK_POLL_MS 1000
+//
+// 200ms (5 fps) since 2026-09-24: the stalls behind the 1000ms choice were
+// internal-RAM starvation (see CAMERA_FRAME_SENDING_FEATURE_ENABLED), now
+// fixed, and frames come JPEG-encoded from the sensor itself, so each one
+// costs only its send.
+#define FACE_TRACK_POLL_MS 200
 // A face position older than this is treated as "no face" by
 // camera_face_track_get_offset(), rather than main.c latching onto a stale
 // position forever once the person steps out of frame or the connection
@@ -118,7 +122,13 @@ static const char *TAG = "camera_face_track";
 // periodic retry, because retrying would just repeatedly re-trigger the
 // exact failure described below. Flip to 1 once that failure is
 // actually root-caused and fixed.
-#define CAMERA_FRAME_SENDING_FEATURE_ENABLED 0
+//
+// Re-enabled 2026-09-24: the failure below was very likely the same
+// internal-RAM exhaustion that also broke audio sends -- WiFi TX buffer
+// allocations (1630 bytes, DMA-capable internal RAM) failing once camera +
+// AFE init left only ~1.5KB contiguous, so large writes stalled until
+// their timeout. Fixed by CONFIG_CAMERA_PSRAM_DMA (see sdkconfig.defaults).
+#define CAMERA_FRAME_SENDING_FEATURE_ENABLED 1
 
 // Camera-frame sending is disabled by default. Found on real hardware:
 // a camera frame (base64-encoded JPEG wrapped in a JSON text message --
@@ -213,8 +223,11 @@ static esp_err_t tca9555_camera_power_on(void)
     return err;
 }
 
+// to verify the higher frame rate against real memory/network behavior.
+
 static void face_track_task(void *arg)
 {
+    TickType_t last_wake = xTaskGetTickCount();
     while (true) {
         // Auto-disable/retry -- see CAMERA_SEND_FAILURE_THRESHOLD's
         // comment above. Skips straight past the whole capture+encode
@@ -243,40 +256,37 @@ static void face_track_task(void *arg)
         if (attempt_send) {
             camera_fb_t *fb = esp_camera_fb_get();
             if (fb != NULL) {
-                uint8_t *jpg_buf = NULL;
-                size_t jpg_len = 0;
-                if (fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 30, &jpg_buf, &jpg_len)) {
-                    esp_err_t send_err = server_client_send_camera_frame(jpg_buf, jpg_len);
-                    if (send_err == ESP_OK) {
-                        s_consecutive_send_failures = 0;
-                        if (!s_camera_sending_enabled) {
-                            ESP_LOGI(TAG, "camera-frame sending recovered, re-enabling");
-                            s_camera_sending_enabled = true;
-                        }
-                    } else {
-                        s_consecutive_send_failures++;
-                        if (s_camera_sending_enabled && s_consecutive_send_failures >= CAMERA_SEND_FAILURE_THRESHOLD) {
-                            ESP_LOGW(TAG,
-                                     "camera-frame sending disabled after %d consecutive failures -- "
-                                     "retrying in %dms",
-                                     s_consecutive_send_failures, CAMERA_SEND_RETRY_INTERVAL_MS);
-                            s_camera_sending_enabled = false;
-                            s_camera_sending_disabled_at_us = esp_timer_get_time();
-                        } else if (!s_camera_sending_enabled) {
-                            // A periodic retry attempt failed again --
-                            // push the next retry a full interval out
-                            // rather than trying again next cycle.
-                            s_camera_sending_disabled_at_us = esp_timer_get_time();
-                        }
+                // fb->buf is already a JPEG: the OV2640 encodes in hardware
+                // (PIXFORMAT_JPEG, see camera_face_track_init()).
+                esp_err_t send_err = server_client_send_camera_frame(fb->buf, fb->len);
+                if (send_err == ESP_OK) {
+                    s_consecutive_send_failures = 0;
+                    if (!s_camera_sending_enabled) {
+                        ESP_LOGI(TAG, "camera-frame sending recovered, re-enabling");
+                        s_camera_sending_enabled = true;
                     }
-                    free(jpg_buf); // fmt2jpg() allocates with standard malloc, per esp32-camera's img_converters.h
                 } else {
-                    ESP_LOGW(TAG, "fmt2jpg conversion failed, skipping this frame");
+                    s_consecutive_send_failures++;
+                    if (s_camera_sending_enabled && s_consecutive_send_failures >= CAMERA_SEND_FAILURE_THRESHOLD) {
+                        ESP_LOGW(TAG,
+                                 "camera-frame sending disabled after %d consecutive failures -- "
+                                 "retrying in %dms",
+                                 s_consecutive_send_failures, CAMERA_SEND_RETRY_INTERVAL_MS);
+                        s_camera_sending_enabled = false;
+                        s_camera_sending_disabled_at_us = esp_timer_get_time();
+                    } else if (!s_camera_sending_enabled) {
+                        // A periodic retry attempt failed again --
+                        // push the next retry a full interval out
+                        // rather than trying again next cycle.
+                        s_camera_sending_disabled_at_us = esp_timer_get_time();
+                    }
                 }
                 esp_camera_fb_return(fb);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(FACE_TRACK_POLL_MS));
+        // DelayUntil, not Delay: a steady FACE_TRACK_POLL_MS cadence
+        // regardless of how long this iteration's send took.
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(FACE_TRACK_POLL_MS));
     }
 }
 
@@ -314,19 +324,16 @@ esp_err_t camera_face_track_init(void)
     // TIMER_0/CHANNEL_0/CHANNEL_1 are servo.c's pan/tilt PWM -- avoid both.
     config.ledc_timer = LEDC_TIMER_2;
     config.ledc_channel = LEDC_CHANNEL_2;
-    // RGB565 (not RGB888/JPEG at capture time): this chip's LCD-CAM capture
-    // peripheral only supports GRAYSCALE/YUV422/RGB565/JPEG input sampling
-    // (target/esp32s3/ll_cam.c's ll_cam_set_sample_mode() rejects anything
-    // else) -- confirmed on real hardware (esp_camera_init() fails outright
-    // with PIXFORMAT_RGB888). fmt2jpg() below converts RGB565 to JPEG for
-    // the upload; no RGB888 conversion is needed anymore now that no local
-    // detection model consumes it.
-    config.pixel_format = PIXFORMAT_RGB565;
-    // QVGA (320x240): reasonable preview/detection resolution without
-    // spending extra cycles capturing/encoding a much larger frame than
-    // face_tracking.py's Haar cascade needs.
+    // JPEG straight from the OV2640's hardware encoder (was RGB565 plus a
+    // software fmt2jpg() on core 0 -- the WiFi core -- for every frame).
+    // Frames arrive ready to send, ~10x smaller in PSRAM.
+    config.pixel_format = PIXFORMAT_JPEG;
+    // QVGA (320x240): plenty for the server's face detector and the admin
+    // preview.
     config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 12; // unused at this pixel_format, kept at the driver's documented default
+    // esp32-camera's scale: lower = better quality/bigger. 12 is the
+    // driver's documented default.
+    config.jpeg_quality = 12;
     // Found on real hardware: fb_count=1 + CAMERA_GRAB_WHEN_EMPTY produced
     // repeated "cam_hal: EV-VSYNC-OVF" / "Failed to get frame: timeout" --
     // the sensor free-runs at its own frame rate (tens of ms/frame) but
@@ -339,7 +346,7 @@ esp_err_t camera_face_track_init(void)
     // fast producer" pattern -- always returns the freshest frame instead
     // of blocking/overflowing waiting for us.
     config.fb_count = 2;
-    config.fb_location = CAMERA_FB_IN_PSRAM; // RGB565 QVGA is 320*240*2 = 150KB/frame -- PSRAM only, not internal DRAM
+    config.fb_location = CAMERA_FB_IN_PSRAM; // keep frame buffers out of scarce internal RAM
     config.grab_mode = CAMERA_GRAB_LATEST;
 
     err = esp_camera_init(&config);
@@ -369,7 +376,7 @@ esp_err_t camera_face_track_init(void)
         ESP_LOGE(TAG, "xTaskCreatePinnedToCoreWithCaps(face_track) failed: %d", (int)task_created);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "camera_face_track initialized (OV2640, QVGA, %dms poll, server-side detection)", FACE_TRACK_POLL_MS);
+    ESP_LOGI(TAG, "camera_face_track initialized (OV2640, QVGA JPEG, %dms poll, server-side detection)", FACE_TRACK_POLL_MS);
     return ESP_OK;
 }
 
